@@ -1,0 +1,8 @@
+#!/bin/bash
+# 卸载前：停止终端服务（连带结束本应用自己拉起的 shell 进程）。
+set -u
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ -x "${SCRIPT_DIR}/main" ]; then
+    "${SCRIPT_DIR}/main" stop >> "${TRIM_PKGVAR:-/var/apps/nas-webterm/var}/info.log" 2>&1 || true
+fi
+exit 0

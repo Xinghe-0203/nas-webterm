@@ -1,0 +1,18 @@
+[
+  {
+    "stepTitle": "卸载确认",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载 Web 终端只会停止本应用自己的终端服务并删除程序文件，正在运行的终端进程也会随之结束，不会影响 NAS 上的其它应用与文件。"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_delete_data",
+        "label": "同时删除运行日志与配置",
+        "initValue": "false",
+        "helpText": "开启后会删除应用数据目录中的运行日志与配置文件；关闭则保留，重新安装后可以继续查看。"
+      }
+    ]
+  }
+]

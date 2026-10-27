@@ -1,0 +1,54 @@
+[
+    {
+        "stepTitle": "Web 终端设置",
+        "items": [
+            {
+                "type": "text",
+                "field": "wizard_default_shell",
+                "label": "默认 Shell",
+                "initValue": "/bin/bash",
+                "placeholder": "/bin/bash",
+                "helpText": "新标签页启动的交互式 shell 路径，例如 /bin/bash、/usr/bin/zsh、/usr/bin/fish。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_default_cwd",
+                "label": "默认工作目录",
+                "initValue": "/root",
+                "placeholder": "/root",
+                "helpText": "新标签页的初始目录。目录不存在时自动回退到 /root。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_startup_command",
+                "label": "启动后自动执行的命令（可留空）",
+                "initValue": "",
+                "placeholder": "留空则只开普通 shell",
+                "helpText": "默认留空：新标签页就是一个普通 shell。填入命令后，新标签页打开会自动键入并执行它（例如填一个全屏程序名）。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_idle_minutes",
+                "label": "会话空闲回收（分钟，0 = 永不回收）",
+                "initValue": "0",
+                "placeholder": "0",
+                "helpText": "填 0 表示永不按时间回收：关掉页面后终端继续在后台跑，可以一直连开几天。只有程序自己退出时才会被清理。填其它数值则在该分钟数后回收无人连接的会话。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_max_sessions",
+                "label": "最大同时会话数",
+                "initValue": "32",
+                "placeholder": "32",
+                "helpText": "同时存活的后台终端数量上限（1-64）。达到上限后会拒绝新建并提示你关闭标签页，不会自动杀掉你正在用的会话。"
+            },
+            {
+                "type": "switch",
+                "field": "wizard_strict_admin",
+                "label": "严格校验管理员身份",
+                "initValue": "true",
+                "helpText": "开启后服务端会校验飞牛网关注入的管理员身份标记。仅在网关行为异常、页面提示无权限时才需要关闭。"
+            }
+        ]
+    }
+]

@@ -1,0 +1,34 @@
+#!/bin/bash
+# 设置变更前：校验配置项，非法直接退出（应用中心会展示错误信息）。
+set -u
+
+for pair in "wizard_idle_minutes:${wizard_idle_minutes:-60}:0:10080" \
+            "wizard_max_sessions:${wizard_max_sessions:-16}:1:64"; do
+    name="${pair%%:*}"
+    rest="${pair#*:}"
+    value="${rest%%:*}"
+    rest="${rest#*:}"
+    min="${rest%%:*}"
+    max="${rest##*:}"
+    case "${value}" in
+        '' | *[!0-9]*)
+            printf '%s 必须是纯数字：%s\n' "${name}" "${value}" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${value}" -lt "${min}" ] || [ "${value}" -gt "${max}" ]; then
+        printf '%s 必须在 %s-%s 之间：%s\n' "${name}" "${min}" "${max}" "${value}" >&2
+        exit 1
+    fi
+done
+
+if [ -z "${wizard_default_shell:-}" ]; then
+    printf '默认 Shell 不能为空\n' >&2
+    exit 1
+fi
+if [ -z "${wizard_default_cwd:-}" ]; then
+    printf '默认工作目录不能为空\n' >&2
+    exit 1
+fi
+
+exit 0

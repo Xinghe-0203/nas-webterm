@@ -1,0 +1,17 @@
+{
+    ".url": {
+        "nas-webterm.Application": {
+            "title": "Web 终端",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/nas-webterm",
+            "gatewaySocket": "app.sock",
+            "url": "/app/nas-webterm",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "editable"
+            }
+        }
+    }
+}

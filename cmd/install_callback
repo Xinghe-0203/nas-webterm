@@ -1,0 +1,45 @@
+#!/bin/bash
+# 安装完成：校验并持久化安装向导选项。
+set -u
+
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/nas-webterm/var}"
+LOG_FILE="${PKG_VAR}/info.log"
+mkdir -p "${PKG_VAR}" 2>/dev/null
+
+log_msg() {
+    printf '[%s] [install] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_FILE}" 2>/dev/null
+}
+
+# 数值校验：非纯数字或越界直接失败，应用中心会把错误展示给用户
+for pair in "wizard_idle_minutes:${wizard_idle_minutes:-60}:0:10080" \
+            "wizard_max_sessions:${wizard_max_sessions:-16}:1:64"; do
+    name="${pair%%:*}"
+    rest="${pair#*:}"
+    value="${rest%%:*}"
+    rest="${rest#*:}"
+    min="${rest%%:*}"
+    max="${rest##*:}"
+    case "${value}" in
+        '' | *[!0-9]*)
+            printf '%s 必须是纯数字：%s\n' "${name}" "${value}" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${value}" -lt "${min}" ] || [ "${value}" -gt "${max}" ]; then
+        printf '%s 必须在 %s-%s 之间：%s\n' "${name}" "${min}" "${max}" "${value}" >&2
+        exit 1
+    fi
+done
+
+{
+    printf 'DEFAULT_SHELL=%s\n' "${wizard_default_shell:-/bin/bash}"
+    printf 'DEFAULT_CWD=%s\n' "${wizard_default_cwd:-/root}"
+    printf 'STARTUP_COMMAND=%s\n' "${wizard_startup_command-}"
+    printf 'IDLE_MINUTES=%s\n' "${wizard_idle_minutes:-0}"
+    printf 'MAX_SESSIONS=%s\n' "${wizard_max_sessions:-32}"
+    printf 'STRICT_ADMIN=%s\n' "${wizard_strict_admin:-true}"
+} > "${PKG_VAR}/settings.env" 2>/dev/null
+
+log_msg "installed: shell=${wizard_default_shell:-/bin/bash} cwd=${wizard_default_cwd:-/root} cmd=${wizard_startup_command-} idle=${wizard_idle_minutes:-60} max=${wizard_max_sessions:-16} strict_admin=${wizard_strict_admin:-true}"
+
+exit 0

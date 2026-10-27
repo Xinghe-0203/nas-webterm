@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/png" href="__FN_BASE_RAW__images/icon_64.png" />
+    <title>Web 终端</title>
+    <script>
+      // 网关前缀由 Rust 服务在响应时注入；这里只是占位。
+      window.__FN__ = {
+        base: "__FN_BASE_RAW__",
+        baseRaw: "__FN_BASE_RAW__",
+        version: "__FN_VERSION__",
+        appName: "__FN_APPNAME__",
+        displayName: "__FN_DISPLAY_NAME__",
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <div id="tabbar" class="tabbar">
+        <div id="tabstrip" class="tabstrip"></div>
+        <div class="tabbar-actions">
+          <button id="newtab" class="iconbtn" title="新建标签页（Alt+Shift+T）" aria-label="新建标签页">＋</button>
+          <button id="newtab-menu" class="iconbtn slim" title="新建方式" aria-label="新建方式">▾</button>
+        </div>
+        <div class="tabbar-spacer"></div>
+        <div id="conn" class="conn" title="连接状态"></div>
+      </div>
+      <div id="panes" class="panes"></div>
+      <div id="menu" class="menu" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

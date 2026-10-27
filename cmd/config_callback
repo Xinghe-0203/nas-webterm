@@ -1,0 +1,27 @@
+#!/bin/bash
+# 设置变更后：持久化新配置并重启应用使配置生效。
+set -u
+
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/nas-webterm/var}"
+LOG_FILE="${PKG_VAR}/info.log"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+mkdir -p "${PKG_VAR}" 2>/dev/null
+
+{
+    printf 'DEFAULT_SHELL=%s\n' "${wizard_default_shell:-/bin/bash}"
+    printf 'DEFAULT_CWD=%s\n' "${wizard_default_cwd:-/root}"
+    printf 'STARTUP_COMMAND=%s\n' "${wizard_startup_command-}"
+    printf 'IDLE_MINUTES=%s\n' "${wizard_idle_minutes:-0}"
+    printf 'MAX_SESSIONS=%s\n' "${wizard_max_sessions:-32}"
+    printf 'STRICT_ADMIN=%s\n' "${wizard_strict_admin:-true}"
+} > "${PKG_VAR}/settings.env" 2>/dev/null
+
+printf '[%s] [config] settings updated\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE}" 2>/dev/null
+
+# 重启使配置生效；start 是幂等的，应用中心后续再启动一次也不会重复拉起
+if [ -x "${SCRIPT_DIR}/main" ]; then
+    "${SCRIPT_DIR}/main" stop >> "${LOG_FILE}" 2>&1 || true
+    "${SCRIPT_DIR}/main" start >> "${LOG_FILE}" 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,235 @@
+#!/bin/bash
+# Web 终端 nas-webterm —— 应用生命周期管理（start / stop / status）
+#
+# 进程模型：单进程。
+#   webterm（Rust）以 root 运行，同时提供静态页面、REST 接口与 WebSocket 终端通道，
+#   监听 ${TRIM_APPDEST}/app.sock 接入飞牛统一网关，不监听任何 TCP 端口。
+#
+# 因为要提供 root shell，服务本身必须以 root 运行；socket 权限默认 0600，
+# 只有系统网关（以 root 运行的 trim_http_cgi）能够连接。
+#
+# 所有路径均来自 fnOS 注入的 TRIM_* 环境变量，未注入时回退到 /var/apps 布局，
+# 便于在开发机上单独调试脚本。
+
+set -u
+
+APP_NAME="nas-webterm"
+APP_VERSION="1.0.0"
+PKG_DEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
+PKG_HOME="${TRIM_PKGHOME:-/var/apps/${APP_NAME}/home}"
+SERVER_DIR="${PKG_DEST}/server"
+UI_DIR="${PKG_DEST}/ui"
+APP_SOCKET="${PKG_DEST}/app.sock"
+PID_FILE="${PKG_VAR}/webterm.pid"
+LOG_FILE="${PKG_VAR}/info.log"
+TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+
+# 安装向导选项持久化（安装/设置变更时写入）
+if [ -r "${PKG_VAR}/settings.env" ]; then
+    # shellcheck disable=SC1091
+    . "${PKG_VAR}/settings.env"
+fi
+
+DEFAULT_SHELL="${DEFAULT_SHELL:-/bin/bash}"
+DEFAULT_CWD="${DEFAULT_CWD:-/root}"
+# 注意用 ${VAR-default}（不加冒号）：用户清空这一项就是要「只开普通 shell」，
+# 空值必须保留为空，不能被默认值覆盖。
+STARTUP_COMMAND="${STARTUP_COMMAND-}"
+IDLE_MINUTES="${IDLE_MINUTES:-0}"
+MAX_SESSIONS="${MAX_SESSIONS:-32}"
+STRICT_ADMIN="${STRICT_ADMIN:-true}"
+# socket 权限：默认 0600（仅 root 可连；飞牛网关 trim_http_cgi 以 root 运行）。
+SOCKET_MODE="${SOCKET_MODE:-600}"
+SOCKET_GID="${SOCKET_GID:-}"
+
+log_msg() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_FILE}" 2>/dev/null
+}
+
+fail_msg() {
+    log_msg "ERROR: $*"
+    if [ -n "${TEMP_LOG}" ]; then
+        printf '%s\n' "$*" > "${TEMP_LOG}" 2>/dev/null
+    fi
+    printf '%s\n' "$*" >&2
+}
+
+mkdir -p "${PKG_VAR}" "${PKG_HOME}" 2>/dev/null
+
+check_process() {
+    local pid="$1"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    [ -r "/proc/${pid}/stat" ] || return 1
+    local state
+    state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null)"
+    case "${state}" in
+        Z | X | x) return 1 ;;
+    esac
+    return 0
+}
+
+read_pid() {
+    local file="$1" pid
+    [ -r "${file}" ] || return 1
+    pid="$(head -n 1 "${file}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${pid}" ] && printf '%s' "${pid}"
+}
+
+# 等待 socket 出现：wait_socket <path> <seconds>
+wait_socket() {
+    local path="$1" seconds="$2" i
+    for ((i = 0; i < seconds * 5; i++)); do
+        [ -S "${path}" ] && return 0
+        sleep 0.2
+    done
+    [ -S "${path}" ]
+}
+
+# 按 CPU 架构选择二进制
+detect_arch() {
+    local machine
+    machine="$(uname -m 2>/dev/null || echo unknown)"
+    case "${machine}" in
+        x86_64 | amd64) echo "x86_64" ;;
+        aarch64 | arm64) echo "aarch64" ;;
+        armv7l | armv7) echo "armv7l" ;;
+        *) echo "${machine}" ;;
+    esac
+}
+
+pick_binary() {
+    local arch candidate
+    arch="$(detect_arch)"
+    for candidate in \
+        "${SERVER_DIR}/nas-webterm-${arch}" \
+        "${SERVER_DIR}/nas-webterm"; do
+        if [ -x "${candidate}" ]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_pattern_pids() {
+    local pattern="$1"
+    command -v pgrep >/dev/null 2>&1 || return 0
+    pgrep -f -- "${pattern}" 2>/dev/null || true
+}
+
+kill_pid() {
+    local pid="$1" label="$2" waited=0
+    [ -n "${pid}" ] || return 0
+    check_process "${pid}" || return 0
+    log_msg "stopping ${label} (pid=${pid})"
+    kill -TERM "${pid}" 2>/dev/null || true
+    while check_process "${pid}" && [ "${waited}" -lt 100 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if check_process "${pid}"; then
+        log_msg "force killing ${label} (pid=${pid})"
+        kill -KILL "${pid}" 2>/dev/null || true
+        sleep 0.2
+    fi
+    return 0
+}
+
+stop_all() {
+    local pid extra
+    pid="$(read_pid "${PID_FILE}" || true)"
+    kill_pid "${pid}" "webterm"
+    rm -f "${PID_FILE}" "${APP_SOCKET}"
+
+    # pid 文件丢失时按唯一路径兜底清理，避免残留进程占用 socket
+    for extra in $(find_pattern_pids "${SERVER_DIR}/nas-webterm"); do
+        kill_pid "${extra}" "webterm (orphan)"
+        rm -f "${APP_SOCKET}"
+    done
+    return 0
+}
+
+is_running() {
+    local pid
+    pid="$(read_pid "${PID_FILE}" || true)"
+    check_process "${pid}" || return 1
+    [ -S "${APP_SOCKET}" ] || return 1
+    return 0
+}
+
+start_all() {
+    if is_running; then
+        log_msg "already running, skip start"
+        exit 0
+    fi
+
+    stop_all
+
+    local binary
+    if ! binary="$(pick_binary)"; then
+        fail_msg "未找到可执行文件（架构 $(detect_arch)），请重新安装 Web 终端。"
+        exit 1
+    fi
+
+    if [ ! -f "${UI_DIR}/index.html" ]; then
+        fail_msg "前端资源缺失：${UI_DIR}/index.html，请重新安装 Web 终端。"
+        exit 1
+    fi
+
+    local -a args=(
+        --socket "${APP_SOCKET}"
+        --ui-dir "${UI_DIR}"
+        --gateway-prefix "/app/${APP_NAME}"
+        --app-name "${APP_NAME}"
+        --display-name "Web 终端"
+        --version "${TRIM_APPVER:-${APP_VERSION}}"
+        --shell "${DEFAULT_SHELL}"
+        --cwd "${DEFAULT_CWD}"
+        --startup-command "${STARTUP_COMMAND}"
+        --idle-minutes "${IDLE_MINUTES}"
+        --max-sessions "${MAX_SESSIONS}"
+        --socket-mode "${SOCKET_MODE}"
+        --require-admin "${STRICT_ADMIN}"
+    )
+    # 日志只由下面的 shell 重定向写入 LOG_FILE；不要再传 --log-file，
+    # 否则日志模块写文件 + stderr 重定向会让每行重复一次。
+    if [ -n "${SOCKET_GID}" ]; then
+        args+=(--socket-gid "${SOCKET_GID}")
+    fi
+
+    log_msg "starting ${binary} (arch=$(detect_arch), shell=${DEFAULT_SHELL}, cmd=${STARTUP_COMMAND:-none})"
+    nohup "${binary}" "${args[@]}" >> "${LOG_FILE}" 2>&1 &
+    printf '%s' "$!" > "${PID_FILE}"
+
+    if ! wait_socket "${APP_SOCKET}" 30; then
+        fail_msg "Web 终端启动失败，请查看日志 ${LOG_FILE}。"
+        stop_all
+        exit 1
+    fi
+
+    log_msg "nas-webterm started (pid=$(cat "${PID_FILE}" 2>/dev/null))"
+    exit 0
+}
+
+case "${1:-}" in
+    start)
+        start_all
+        ;;
+    stop)
+        stop_all
+        log_msg "nas-webterm stopped"
+        exit 0
+        ;;
+    status)
+        if is_running; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        echo "usage: $0 {start|stop|status}" >&2
+        exit 1
+        ;;
+esac

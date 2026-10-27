@@ -1,0 +1,50 @@
+#!/bin/bash
+# 升级完成：清理旧 socket、按用户选择迁移旧默认值，并尝试自动拉起应用
+# （应用中心之后也会启动，重复启动是幂等的）。
+set -u
+
+PKG_DEST="${TRIM_APPDEST:-/var/apps/nas-webterm/target}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/nas-webterm/var}"
+SETTINGS="${PKG_VAR}/settings.env"
+mkdir -p "${PKG_VAR}" 2>/dev/null
+rm -f "${PKG_DEST}/app.sock" "${PKG_VAR}/webterm.pid" 2>/dev/null
+
+log_line() {
+    printf '[%s] [upgrade] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${PKG_VAR}/info.log" 2>/dev/null
+}
+
+# 1.0.x 的默认行为是「新标签页自动执行一条命令」。若用户在升级向导里勾选了
+# 「清空新标签页自动执行的命令」，就把这一项清空；其余配置保持不动。
+case "${wizard_clear_startup:-true}" in
+    true | True | TRUE | 1 | yes)
+        if [ -r "${SETTINGS}" ] && grep -q '^STARTUP_COMMAND=' "${SETTINGS}"; then
+            tmp="${SETTINGS}.tmp.$$"
+            sed 's/^STARTUP_COMMAND=.*/STARTUP_COMMAND=/' "${SETTINGS}" > "${tmp}" 2>/dev/null &&
+                mv -f "${tmp}" "${SETTINGS}" 2>/dev/null
+            rm -f "${tmp}" 2>/dev/null
+            log_line "cleared legacy default STARTUP_COMMAND"
+        fi
+        ;;
+esac
+
+# 1.0.x 的默认空闲回收是 60 分钟。若用户在升级向导里勾选了「空闲会话永不回收」，
+# 改为 0（永不按时间杀会话），这样终端可以一直挂着连开好几天。
+case "${wizard_keep_sessions:-true}" in
+    true | True | TRUE | 1 | yes)
+        if [ -r "${SETTINGS}" ] && grep -q '^IDLE_MINUTES=' "${SETTINGS}"; then
+            tmp="${SETTINGS}.tmp.$$"
+            sed 's/^IDLE_MINUTES=.*/IDLE_MINUTES=0/' "${SETTINGS}" > "${tmp}" 2>/dev/null &&
+                mv -f "${tmp}" "${SETTINGS}" 2>/dev/null
+            rm -f "${tmp}" 2>/dev/null
+            log_line "set IDLE_MINUTES=0 (never reap idle sessions)"
+        fi
+        ;;
+esac
+
+log_line "upgraded to ${TRIM_APPVER:-unknown}"
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ -x "${SCRIPT_DIR}/main" ]; then
+    "${SCRIPT_DIR}/main" start >> "${PKG_VAR}/info.log" 2>&1 || true
+fi
+exit 0

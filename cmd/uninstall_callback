@@ -1,0 +1,19 @@
+#!/bin/bash
+# 卸载完成：按用户选择决定是否删除本机日志与配置。
+set -u
+
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/nas-webterm/var}"
+
+case "${wizard_delete_data:-false}" in
+    true | True | TRUE | 1 | yes)
+        case "${PKG_VAR}" in
+            "" | "/" | "/var" | "/var/apps")
+                exit 0
+                ;;
+        esac
+        rm -f "${PKG_VAR}"/info.log "${PKG_VAR}"/settings.env \
+              "${PKG_VAR}"/webterm.pid 2>/dev/null
+        ;;
+esac
+
+exit 0

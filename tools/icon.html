@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Web 终端图标</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 256px;
+        height: 256px;
+        background: transparent;
+        overflow: hidden;
+      }
+
+      .icon {
+        position: absolute;
+        inset: 14px;
+        border-radius: 46px;
+        background: linear-gradient(160deg, #3a3a40 0%, #17171b 42%, #0a0a0c 100%);
+        box-shadow:
+          0 0 0 1.5px rgba(255, 255, 255, 0.22) inset,
+          0 6px 18px rgba(0, 0, 0, 0.28);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .prompt {
+        color: #f6f7f9;
+        font-family: "SF Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace;
+        font-size: 74px;
+        font-weight: 500;
+        line-height: 1;
+        letter-spacing: -2px;
+        text-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+        transform: translateY(4px);
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="icon"><span class="prompt">&gt;_</span></div>
+  </body>
+</html>

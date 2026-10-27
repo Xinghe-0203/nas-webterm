@@ -1,0 +1,24 @@
+# 打包产物
+dist/
+*.fpk
+*.fpk.sha256
+
+# Rust 编译缓存
+rust/target/
+
+# Node 依赖（package-lock.json 需要纳入版本管理，保证依赖可复现）
+web/node_modules/
+
+# 构建出来的后端二进制（由 build.sh 交叉编译生成）
+app/server/nas-webterm-*
+
+# 构建出来的前端资源（由 web/ 下的 vite 构建生成）
+app/ui/index.html
+app/ui/assets/
+
+# 打包工具（build.sh 会自动下载）
+tools/fnpack
+
+# 系统垃圾
+.DS_Store
+*.log

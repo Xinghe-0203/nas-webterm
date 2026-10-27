@@ -1,0 +1,12 @@
+#!/bin/bash
+# 安装前：创建应用数据目录并清理可能残留的 socket / pid 文件。
+set -u
+
+PKG_DEST="${TRIM_APPDEST:-/var/apps/nas-webterm/target}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/nas-webterm/var}"
+PKG_HOME="${TRIM_PKGHOME:-/var/apps/nas-webterm/home}"
+
+mkdir -p "${PKG_VAR}" "${PKG_HOME}" 2>/dev/null
+rm -f "${PKG_DEST}/app.sock" "${PKG_VAR}/webterm.pid" 2>/dev/null
+
+exit 0

@@ -1,0 +1,306 @@
+:root {
+  --bg: #0c0d11;
+  --bar: #1c1f26;
+  --bar-hover: #282d37;
+  --fg: #d8dce3;
+  --muted: #8b93a1;
+  --border: #333945;
+  --accent: #4c8dff;
+  --danger: #e5534b;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* ---------- 标签栏（浏览器风格） ---------- */
+.tabbar {
+  display: flex;
+  align-items: flex-end;
+  height: 42px;
+  flex: 0 0 42px;
+  padding: 6px 10px 0 10px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  position: relative;
+  gap: 4px;
+}
+
+.tabstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  height: 100%;
+}
+
+.tabstrip::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 14px;
+  height: 32px;
+  min-width: 104px;
+  max-width: 220px;
+  color: var(--muted);
+  cursor: default;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+  position: relative;
+  flex: 0 0 auto;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.tab:hover {
+  background: var(--bar-hover);
+  color: var(--fg);
+}
+
+.tab:not(.active) {
+  background: rgba(255, 255, 255, 0.028);
+}
+
+.tab.active {
+  background: var(--bg);
+  color: var(--fg);
+  border-color: var(--border);
+  box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.28);
+}
+
+/* 活动标签与终端区域连成一体：盖住标签栏的下边框 */
+.tab.active::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--bg);
+}
+
+.tab .title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab .close {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  line-height: 15px;
+  text-align: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  cursor: pointer;
+  opacity: 0;
+  padding: 0;
+}
+
+.tab:hover .close,
+.tab.active .close {
+  opacity: 0.55;
+}
+
+.tab .close:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.tab .dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  opacity: 0;
+}
+
+.tab .dot.on {
+  opacity: 1;
+}
+
+.tabbar-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 100%;
+  padding-bottom: 4px;
+}
+
+.iconbtn {
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.iconbtn:hover {
+  color: var(--fg);
+  background: var(--bar-hover);
+  border-color: var(--border);
+}
+
+.iconbtn.slim {
+  width: 20px;
+  font-size: 10px;
+}
+
+.tabbar-spacer {
+  flex: 1 1 auto;
+}
+
+.conn {
+  display: flex;
+  align-items: flex-end;
+  gap: 7px;
+  padding: 0 4px 8px 4px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.conn .led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.conn.online .led {
+  background: #3fb950;
+}
+
+.conn.connecting .led {
+  background: #d29922;
+}
+
+/* ---------- 终端面板 ---------- */
+.panes {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.pane {
+  position: absolute;
+  inset: 0;
+  display: none;
+  padding: 8px 4px 4px 10px;
+  box-sizing: border-box;
+}
+
+.pane.active {
+  display: block;
+}
+
+.pane .xterm {
+  height: 100%;
+}
+
+.pane .xterm-viewport {
+  scrollbar-width: thin;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+
+/* ---------- 右键菜单 ---------- */
+.menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 168px;
+  padding: 4px;
+  background: #1c1f26;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.menu button:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.menu button small {
+  color: var(--muted);
+  margin-left: 6px;
+}
+
+.menu button:hover small {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* ---------- 浅色主题 ---------- */
+html[data-theme="light"] {
+  --bg: #fbfbfc;
+  --bar: #e9eaee;
+  --bar-hover: #dfe1e6;
+  --fg: #1e2128;
+  --muted: #6b7280;
+  --border: #d3d6dc;
+}
