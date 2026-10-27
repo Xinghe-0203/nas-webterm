@@ -5,8 +5,9 @@
 
 - 应用名：`nas-webterm`
 - 显示名：Web 终端
-- 版本：1.0.0
-- 产物：`dist/nas-webterm-1.0.0.fpk`（含 x86_64 + aarch64 双架构）
+- 版本：1.0.1
+- 源码：https://github.com/Xinghe-0203/nas-webterm
+- 产物：`dist/nas-webterm-1.0.1.fpk`（含 x86_64 + aarch64 双架构）
 
 ---
 
@@ -195,6 +196,24 @@ TUI 的重绘被画到主屏上。处理方式：
 ---
 
 ## 8. 构建与测试
+
+> 仓库里不放预编译产物：`app/server/` 的二进制和 `app/ui/` 的前端资源都由构建脚本生成。
+
+```bash
+git clone https://github.com/Xinghe-0203/nas-webterm.git
+cd nas-webterm
+./build.sh --with-browser     # 产物在 dist/nas-webterm-<version>.fpk
+```
+
+构建依赖：
+
+| 依赖 | 用途 | 缺失时 |
+| --- | --- | --- |
+| Rust 1.75+ | 后端 | 必须 |
+| `gcc-aarch64-linux-gnu` | 交叉编译 arm 架构 | 只能用 `--arch x86_64` |
+| Node.js 18+ | 前端构建 | 必须 |
+| chromium | 浏览器自动化验证 | 跳过浏览器相关测试 |
+| fnpack | 打包成 .fpk | `build.sh` 会自动下载 |
 
 ```bash
 ./build.sh                  # 双架构编译 + 前端构建 + 冒烟测试 + fnpack 打包 + 产物校验
