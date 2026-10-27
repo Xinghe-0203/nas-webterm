@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const args = { wait: 16000, cmd: 'htop' };
+const args = { wait: 5000, cmd: 'htop', boot: 14000 };
 for (let i = 2; i < process.argv.length; i += 1) {
   if (!process.argv[i].startsWith('--')) continue;
   const key = process.argv[i].slice(2);
@@ -121,6 +121,16 @@ class Cdp {
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
     await sleep(Number(args.wait));
+
+    // 自己键入目标命令（不依赖服务端是否配置了启动命令）
+    await cdp.eval('window.__webterm__ && window.__webterm__.focusActive()');
+    await sleep(400);
+    await cdp.send('Input.insertText', { text: String(args.cmd) });
+    await sleep(250);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    // 全屏程序启动需要时间
+    await sleep(Number(args.boot || 14000));
 
     const text = String(await cdp.eval('window.__webterm__ ? window.__webterm__.activeBufferText() : ""'));
 
