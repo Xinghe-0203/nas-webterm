@@ -633,6 +633,28 @@ impl SessionManager {
         }
     }
 
+    /// 关停服务时结束全部会话。
+    ///
+    /// 服务收到 SIGTERM 后必须把 PTY 里的 shell 一起收掉，否则会出现两个问题：
+    ///   1. shell 变成孤儿进程，继续挂在后台跑；
+    ///   2. tokio 运行时析构时要等待所有 spawn_blocking 任务结束，而读写线程
+    ///      阻塞在 `input_rx.blocking_recv()` / `reader.read()` 上，永远等不到，
+    ///      进程就会卡住不退出，最后被 fnOS 用 SIGKILL 强杀（线上日志里的
+    ///      "force killing webterm" 就是这么来的）。
+    pub fn kill_all(&self) {
+        let sessions: Vec<Arc<Session>> = {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard.drain().map(|(_, s)| s).collect()
+        };
+        if sessions.is_empty() {
+            return;
+        }
+        crate::log_info!("正在结束 {} 个会话", sessions.len());
+        for s in sessions {
+            s.kill();
+        }
+    }
+
     /// 清理已退出且没有客户端连接的会话。
     ///
     /// **不按时间杀会话**：`idle_minutes = 0` 表示永不回收，用户可以把终端连开几天。

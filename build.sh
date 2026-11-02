@@ -69,14 +69,35 @@ find_node() {
 
 find_cargo() {
     local candidate
-    for candidate in "${CARGO_BIN:-}" "${HOME}/.cargo/bin/cargo" /usr/local/bin/cargo /usr/bin/cargo; do
-        if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+    # 1) 显式指定
+    if [ -n "${CARGO_BIN:-}" ] && [ -x "${CARGO_BIN}" ]; then
+        printf '%s' "${CARGO_BIN}"
+        return 0
+    fi
+    # 2) PATH 里的 cargo。
+    #    注意：rustup 装出来的 cargo 是代理脚本，一旦 rustup 元数据损坏
+    #    （比如装到一半就中断），代理会直接报错，这里必须先验证能不能用。
+    candidate="$(command -v cargo 2>/dev/null || true)"
+    if [ -n "${candidate}" ] && "${candidate}" --version >/dev/null 2>&1; then
+        printf '%s' "${candidate}"
+        return 0
+    fi
+    # 3) rustup 工具链目录里的真身（绕开坏掉的代理）
+    for candidate in "${RUSTUP_HOME:-${HOME}/.rustup}"/toolchains/*/bin/cargo; do
+        if [ -x "${candidate}" ]; then
             printf '%s' "${candidate}"
             return 0
         fi
     done
-    candidate="$(command -v cargo 2>/dev/null || true)"
-    [ -n "${candidate}" ] && printf '%s' "${candidate}"
+    # 4) 系统里常见的固定位置
+    for candidate in /usr/local/bin/cargo /usr/bin/cargo; do
+        if [ -x "${candidate}" ]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    [ -n "${candidate:-}" ] && printf '%s' "${candidate}"
+    return 0
 }
 
 find_fnpack() {
@@ -114,7 +135,20 @@ export PATH="$(dirname "${CARGO}"):${PATH}"
 
 # rustc 与 cargo 同一个目录；找不到就用 PATH 里的
 RUSTC="$(dirname "${CARGO}")/rustc"
-[ -x "${RUSTC}" ] || RUSTC="$(command -v rustc 2>/dev/null || true)"
+if ! { [ -x "${RUSTC}" ] && "${RUSTC}" --version >/dev/null 2>&1; }; then
+    # 同目录的 rustc 不可用（常见于 rustup 代理 + 元数据损坏）：退回 PATH 查找
+    RUSTC="$(command -v rustc 2>/dev/null || true)"
+fi
+if ! { [ -n "${RUSTC}" ] && [ -x "${RUSTC}" ] && "${RUSTC}" --version >/dev/null 2>&1; }; then
+    # 再退回 rustup 工具链目录里的真身
+    RUSTC=""
+    for candidate in "${RUSTUP_HOME:-${HOME}/.rustup}"/toolchains/*/bin/rustc; do
+        if [ -x "${candidate}" ]; then
+            RUSTC="${candidate}"
+            break
+        fi
+    done
+fi
 [ -n "${RUSTC}" ] || fail "未找到 rustc，请检查 Rust 工具链安装是否完整"
 
 # ---------------------------------------------------------------------------

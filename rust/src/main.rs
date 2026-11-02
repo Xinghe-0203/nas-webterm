@@ -71,6 +71,10 @@ fn main() {
         log_error!("致命错误: {}", e);
         std::process::exit(1);
     }
+    // 直接 drop 运行时的话，析构会一直等待 PTY 读写这类 spawn_blocking 任务结束，
+    // 而它们只有在会话被彻底结束后才会返回。这里给一个上限，
+    // 保证收到 SIGTERM 后进程能及时退出（线上日志里的 "force killing webterm"）。
+    runtime.shutdown_timeout(Duration::from_secs(2));
 }
 
 async fn run(cfg: Config) -> Result<(), String> {
@@ -100,6 +104,8 @@ async fn run(cfg: Config) -> Result<(), String> {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("服务异常退出: {}", e))?;
+        log_info!("开发模式：服务已停止，正在清理会话");
+        mgr.kill_all();
         return Ok(());
     }
 
@@ -129,6 +135,9 @@ async fn run(cfg: Config) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("服务异常退出: {}", e))?;
+    // 先把会话全部收掉，再宣布停止：顺序反了的话，运行时会卡在等待
+    // PTY 读写线程上，进程迟迟退不出去（fnOS 只能强杀）。
+    mgr.kill_all();
     log_info!("nas-webterm 已停止");
     Ok(())
 }
