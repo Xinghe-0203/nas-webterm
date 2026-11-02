@@ -5,7 +5,7 @@
 //! - 保留最近 256KB 输出用于断线重连后回放，刷新页面不丢屏；
 //! - 空闲会话按 TTL 回收，避免长期占用 root 进程。
 
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -185,20 +185,57 @@ impl Session {
         });
 
         // 写入线程：把输入队列的字节真正写进 PTY。
+        let weak_write = Arc::downgrade(&session);
         tokio::task::spawn_blocking(move || {
             while let Some(data) = input_rx.blocking_recv() {
                 if writer.write_all(&data).is_err() {
+                    // 写失败说明 PTY 已经不可用了（主程序退出 / master 被关闭）。
+                    // 必须把会话标记成结束，否则后续输入会被静默吞掉，
+                    // 页面还一直显示「运行中」。
+                    crate::log_warn!("会话的 PTY 写入失败，标记为已结束");
+                    if let Some(s) = weak_write.upgrade() {
+                        s.on_child_exit(ExitInfo {
+                            code: -1,
+                            signal: None,
+                        });
+                    }
                     break;
                 }
             }
         });
 
-        // 读取线程：把 PTY 输出推给所有客户端。
+        // 子进程回收线程：与 PTY 读取线程**解耦**。
         //
-        // 子进程句柄由本线程持有并负责 wait 回收。若把 Child 放在会话对象里，
-        // 会话先被销毁时回收逻辑就再也执行不到，每杀一个会话就会留下一个僵尸进程。
-        let weak = Arc::downgrade(&session);
+        // 旧实现把 Child 句柄放在读取线程里，等「PTY 读到 EOF」才 wait 回收。
+        // 但 EOF 依赖所有持有 slave fd 的进程都退出：终端里跑 `sleep 999 &`
+        // 再退出 shell 时，后台进程仍持有 slave fd，master 永远读不到 EOF，
+        // 于是 shell 变成僵尸进程、客户端收不到退出通知、会话一直占着名额。
+        //
+        // 现在由独立的线程阻塞 wait：子进程一退出就立刻回收并通知客户端，
+        // 与 PTY 是否还有输出无关。
+        let weak_child = Arc::downgrade(&session);
         let mut child = child;
+        tokio::task::spawn_blocking(move || {
+            let info = match child.wait() {
+                Ok(st) => ExitInfo {
+                    code: st.exit_code() as i32,
+                    signal: exit_signal(&st),
+                },
+                Err(e) => {
+                    crate::log_warn!("等待子进程退出失败: {}", e);
+                    ExitInfo {
+                        code: -1,
+                        signal: None,
+                    }
+                }
+            };
+            if let Some(s) = weak_child.upgrade() {
+                s.on_child_exit(info);
+            }
+        });
+
+        // 读取线程：只负责把 PTY 输出推给所有客户端。
+        let weak = Arc::downgrade(&session);
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; READ_BUF];
             loop {
@@ -216,11 +253,7 @@ impl Session {
                     None => break,
                 }
             }
-            // 无论会话是否还在，都要把子进程回收掉，避免僵尸进程堆积
-            let info = reap_child(&mut child);
-            if let Some(s) = weak.upgrade() {
-                s.on_child_exit(info);
-            }
+            // 子进程的 wait 由上面那个独立的回收线程负责，这里不重复 wait。
         });
 
         // 新会话自动键入的命令：等 shell 吐出第一段输出（提示符）后再发送，
@@ -372,13 +405,24 @@ impl Session {
 
     /// 子进程退出：记录退出码并通知客户端。
     fn on_child_exit(&self, info: ExitInfo) {
-        *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(info.clone());
+        // 只报告一次：写线程失败和子进程回收都可能走到这里。
+        {
+            let mut exit = self.exit.lock().unwrap_or_else(|e| e.into_inner());
+            if exit.is_some() {
+                return;
+            }
+            *exit = Some(info.clone());
+        }
         self.alive.store(false, Ordering::Relaxed);
 
         let payload = serde_json::to_vec(&info).unwrap_or_default();
         let frame = Bytes::from(proto::frame(proto::S_EXIT, &payload));
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         clients.retain(|(_, tx)| tx.try_send(frame.clone()).is_ok());
+        // 子进程已经退出：把客户端连接全部释放掉。
+        // 否则 WebSocket 会一直挂着（前端收到 S_EXIT 也不会主动断开），
+        // 这个死会话会一直占着 max_sessions 的名额，反复 exit 就会把名额耗光。
+        clients.clear();
     }
 
     /// 挂载一个客户端。
@@ -402,6 +446,8 @@ impl Session {
             // alt_enter_idx 还有效，说明回放里带着「进入备用屏幕」那个起点，
             // 客户端直接回放即可；起点被裁掉了才需要客户端自己补一条。
             let has_entry = self.alt_enter_idx.load(Ordering::Relaxed) != usize::MAX;
+            // 整段回放 = 断线重连后恢复屏幕所需的全部历史。
+            // （不能只回放「挂载之后」的新增部分，否则重连的页面会一片空白。）
             (trim_to_safe(&buf), alt_screen && !has_entry)
         };
 
@@ -424,14 +470,21 @@ impl Session {
     }
 
     /// 写入终端输入。
+    ///
+    /// 不能无限期等待：输入队列是有界的（1024 条），PTY 写不动时
+    /// （前台程序不读 stdin、或粘贴了超大段文本）队列会填满，
+    /// 这里就会一直挂着 —— 而调用方是 WebSocket 的事件循环，
+    /// 一旦卡住，输出转发和心跳都会停，前端表现为「终端卡死」。
+    /// 所以这里加超时：超时后放弃这次输入并报错，让前端知道发生了什么。
     pub async fn write_input(&self, data: Vec<u8>) -> Result<(), String> {
         if data.is_empty() {
             return Ok(());
         }
-        self.input_tx
-            .send(data)
-            .await
-            .map_err(|_| "会话已结束".to_string())
+        match tokio::time::timeout(Duration::from_secs(2), self.input_tx.send(data)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("会话已结束".to_string()),
+            Err(_) => Err("终端输入阻塞：程序没有在读取输入".to_string()),
+        }
     }
 
     /// 调整 PTY 尺寸。
@@ -556,7 +609,16 @@ impl SessionManager {
 
     fn next_id(&self) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("s{}-{:x}", n, random_u32())
+        // 128 位随机后缀：会话 id 可以直接用来接管别人的终端（root shell），
+        // 32 位随机既容易被枚举，碰撞概率也不再可忽略。
+        format!(
+            "s{}-{:08x}{:08x}{:08x}{:08x}",
+            n,
+            random_u32(),
+            random_u32(),
+            random_u32(),
+            random_u32()
+        )
     }
 
     pub fn create(
@@ -565,13 +627,41 @@ impl SessionManager {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<Session>, String> {
-        // 快路径：容量已满时直接拒绝，不去白创建一个 PTY 进程。
-        {
-            let guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // 容量检查与「腾名额」放在同一个临界区里。
+        //
+        // 名额满了的时候，优先回收**没有任何客户端连接**的孤儿会话
+        // （前端异常断开、页面刷新、重启标签页没删旧会话等都会留下这种残留）。
+        // 否则几次误操作就能占满 max_sessions，整个应用彻底不可用，
+        // 而用户只能去重启服务。
+        let evicted = {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if guard.len() >= self.cfg.max_sessions {
-                return Err(limit_error(self.cfg.max_sessions));
+                // 最老的孤儿会话优先淘汰。
+                // 注意方向：`created.elapsed()` 是「已经过去多久」，
+                // 越老的会话这个值越大，所以要取 max 才是最老的那个
+                // （用 min 会淘汰掉刚建的那个，用户反而丢不掉真正没人要的残留）。
+                let victim = guard
+                    .iter()
+                    .filter(|(_, s)| s.client_count() == 0)
+                    .max_by_key(|(_, s)| s.created.elapsed())
+                    .map(|(id, _)| id.clone());
+                match victim {
+                    Some(id) => guard.remove(&id),
+                    None => return Err(limit_error(self.cfg.max_sessions)),
+                }
+            } else {
+                None
             }
+        };
+        if let Some(s) = evicted {
+            crate::log_warn!(
+                "会话数已达上限（{} 个），回收无人连接的会话 {}",
+                self.cfg.max_sessions,
+                s.id
+            );
+            s.kill();
         }
+
         let id = self.next_id();
         let session = Session::spawn(&self.cfg, id.clone(), cols, rows, startup)?;
         // 权威判断：创建 PTY 需要时间，这期间可能有别的请求把名额占满，
@@ -659,7 +749,8 @@ impl SessionManager {
     ///
     /// **不按时间杀会话**：`idle_minutes = 0` 表示永不回收，用户可以把终端连开几天。
     /// 只有程序自己退出、且没有页面还挂着它时才会被清掉（避免残留死会话）。
-    /// 容量达到上限时也不杀旧会话，改为拒绝新建，由前端提示用户关标签页。
+    /// 容量达到上限时，会先回收没有任何客户端连接的孤儿会话（见 `create`），
+    /// 实在腾不出名额才拒绝新建，由前端提示用户关标签页。
     pub fn reap(&self) {
         let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -695,44 +786,59 @@ impl SessionManager {
     }
 }
 
-/// 等待子进程退出并回收，返回退出信息。
+/// 从 portable-pty 的退出状态里取出信号编号。
 ///
-/// 必须在持有 Child 句柄的线程里调用：wait 的结果只有子进程的父进程能拿到。
-fn reap_child(child: &mut Box<dyn Child + Send + Sync>) -> ExitInfo {
-    for _ in 0..600 {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                return ExitInfo {
-                    code: st.exit_code() as i32,
-                    signal: None,
-                }
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    // 兜底：PTY 已经关闭但子进程还活着（少见），强制结束并再等一次
-    if let Some(pid) = child.process_id() {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
-    for _ in 0..40 {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                return ExitInfo {
-                    code: st.exit_code() as i32,
-                    signal: None,
-                }
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    ExitInfo {
-        code: -1,
-        signal: None,
-    }
+/// portable-pty 0.8 的 `ExitStatus.signal` 是私有字段、没有公开访问器，
+/// 只能从 Debug 输出里解析（形如 `ExitStatus { code: 0, signal: Some("SIGKILL") }`）。
+/// 拿不到就返回 None —— 只是展示用的信息，拿不到不影响功能。
+fn exit_signal(st: &portable_pty::ExitStatus) -> Option<i32> {
+    parse_signal_from_debug(&format!("{:?}", st))
+}
+
+/// 从 Debug 文本里解析信号名 → 信号编号（拆出来是为了能写单测）。
+fn parse_signal_from_debug(dbg: &str) -> Option<i32> {
+    let name = dbg
+        .split("signal: Some(\"")
+        .nth(1)?
+        .split('"')
+        .next()?
+        .to_string();
+    let n = name.strip_prefix("SIG")?;
+    let num = match n {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" => 31,
+        _ => return n.parse().ok(),
+    };
+    Some(num)
 }
 
 /// 在字节串中查找子串，返回起始下标。
@@ -1047,6 +1153,26 @@ fn detect_locale() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_signal_parses_signal_name() {
+        // portable-pty 0.8 的 ExitStatus Debug 形态
+        let dbg = "ExitStatus { code: 0, signal: Some(\"SIGKILL\") }";
+        assert_eq!(parse_signal_from_debug(dbg), Some(9));
+        let dbg = "ExitStatus { code: 0, signal: Some(\"SIGTERM\") }";
+        assert_eq!(parse_signal_from_debug(dbg), Some(15));
+    }
+
+    #[test]
+    fn exit_signal_handles_missing_signal() {
+        // 正常退出没有信号
+        assert_eq!(
+            parse_signal_from_debug("ExitStatus { code: 0, signal: None }"),
+            None
+        );
+        // 完全不是这个形态
+        assert_eq!(parse_signal_from_debug("whatever"), None);
+    }
 
     #[test]
     fn limit_error_is_detectable() {

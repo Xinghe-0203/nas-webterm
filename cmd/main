@@ -15,7 +15,7 @@ set -u
 
 APP_NAME="nas-webterm"
 # 与 manifest / rust/Cargo.toml 保持一致（升级时三处一起改）
-APP_VERSION="1.0.2"
+APP_VERSION="1.0.3"
 PKG_DEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
 PKG_VAR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
 PKG_HOME="${TRIM_PKGHOME:-/var/apps/${APP_NAME}/home}"
@@ -127,10 +127,22 @@ find_pattern_pids() {
     pgrep -f -- "${pattern}" 2>/dev/null || true
 }
 
+# 确认这个 pid 确实是我们的服务进程。
+# pid 文件可能过期（服务崩溃后 pid 被系统回收、又被别的进程复用），
+# 这时按 pid 杀进程会误杀同机上的无关程序。
+is_webterm_pid() {
+    local pid="$1"
+    [ -n "${pid}" ] || return 1
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q 'nas-webterm'
+}
+
 kill_pid() {
     local pid="$1" label="$2" waited=0
     [ -n "${pid}" ] || return 0
     check_process "${pid}" || return 0
+    # 身份不符就当它不存在，绝不误杀
+    is_webterm_pid "${pid}" || return 0
     log_msg "stopping ${label} (pid=${pid})"
     kill -TERM "${pid}" 2>/dev/null || true
     while check_process "${pid}" && [ "${waited}" -lt 100 ]; do

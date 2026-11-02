@@ -22,9 +22,18 @@ use crate::session::{self, Session, SessionManager};
 /// 网关心跳间隔：必须小于 nginx `proxy_read_timeout 300s`，否则空闲终端会被网关掐断。
 const HEARTBEAT: Duration = Duration::from_secs(20);
 
+/// 回放分片大小：单帧不能太大，否则前端的待发队列（1MB 上限）会整帧丢弃。
+const REPLAY_CHUNK_SIZE: usize = 64 * 1024;
+
+/// 终端尺寸上限：防止畸形客户端把 PTY 设成几千列，把 TUI 渲染拖垮。
+const MAX_COLS: u16 = 1000;
+const MAX_ROWS: u16 = 1000;
+
 pub struct AppState {
     pub mgr: Arc<SessionManager>,
     pub cfg: Config,
+    /// 进程启动时刻：用于 `/api/healthz` 返回真实的运行时长（秒）。
+    pub started_at: std::time::Instant,
 }
 
 impl AppState {
@@ -158,10 +167,9 @@ async fn healthz(State(state): State<Arc<AppState>>) -> Response {
             "version": state.cfg.version,
             "app": state.cfg.app_name,
             "pid": std::process::id(),
-            "uptime": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            // 运行时长（秒）：进程启动至今。
+            // 之前这里误用了 Unix 时间戳（1.7e9 量级），语义完全不对。
+            "uptime": state.started_at.elapsed().as_secs(),
         }
     }))
     .into_response()
@@ -242,7 +250,22 @@ async fn kill_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let ok = state.mgr.kill(&id);
-    axum::Json(serde_json::json!({"ok": ok, "data": {"id": id}})).into_response()
+    if ok {
+        axum::Json(serde_json::json!({"ok": true, "data": {"id": id}})).into_response()
+    } else {
+        // 会话不存在：明确返回 404，调用方才能区分「删掉了」和「本来就没有」。
+        // （前端关闭标签页时会忽略这个错误，不影响使用。）
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "会话不存在",
+                "code": "not_found",
+                "data": {"id": id},
+            })),
+        )
+            .into_response()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,14 +399,23 @@ async fn terminal_loop(
         return;
     }
 
-    // 断线重连回放
-    if !info.replay.is_empty() {
-        let _ = socket
+    // 断线重连回放。
+    //
+    // 必须**分片**发送：回放缓冲区最大能到 4MB（TUI 场景），
+    // 整块塞进一个 WebSocket 帧的话，前端会因超出待发队列上限（1MB）
+    // 把整帧丢掉 —— 重连后终端就一片空白，而且没有任何提示。
+    // 按 64KB 分片后，前端的背压逻辑只会丢最早的几片，不会整段消失。
+    for chunk in info.replay.chunks(REPLAY_CHUNK_SIZE) {
+        if socket
             .send(Message::Binary(Bytes::from(proto::frame(
                 proto::S_OUTPUT,
-                &info.replay,
+                chunk,
             ))))
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 
     // 全屏 TUI：给前台进程发一个 SIGWINCH，程序会自己把整个界面重画一遍
@@ -426,13 +458,46 @@ async fn terminal_loop(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(raw))) => {
-                        if !handle_client_frame(&session, &raw).await {
-                            break;
+                        match handle_client_frame(&session, &raw).await {
+                            FrameOutcome::Continue => {}
+                            FrameOutcome::Close => break,
+                            FrameOutcome::Error(msg) => {
+                                crate::log_warn!("客户端输入处理失败: {}", msg);
+                                let payload =
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "code": "input_blocked",
+                                        "error": msg,
+                                    }))
+                                    .unwrap_or_default();
+                                let _ = socket
+                                    .send(Message::Binary(Bytes::from(proto::frame(
+                                        proto::S_ERROR,
+                                        &payload,
+                                    ))))
+                                    .await;
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
                         // 纯文本帧按终端输入处理
-                        if session.write_input(text.as_str().as_bytes().to_vec()).await.is_err() {
+                        if let Err(e) = session.write_input(text.as_str().as_bytes().to_vec()).await {
+                            if !session.is_alive() {
+                                break;
+                            }
+                            crate::log_warn!("客户端输入处理失败: {}", e);
+                            let payload =
+                                serde_json::to_vec(&serde_json::json!({
+                                    "code": "input_blocked",
+                                    "error": e,
+                                }))
+                                .unwrap_or_default();
+                            let _ = socket
+                                .send(Message::Binary(Bytes::from(proto::frame(
+                                    proto::S_ERROR,
+                                    &payload,
+                                ))))
+                                .await;
                             break;
                         }
                     }
@@ -454,20 +519,54 @@ async fn terminal_loop(
 }
 
 /// 处理客户端二进制帧。返回 false 表示应当断开。
-async fn handle_client_frame(session: &Arc<Session>, raw: &[u8]) -> bool {
+/// 客户端帧的处理结果。
+enum FrameOutcome {
+    /// 继续等待下一帧
+    Continue,
+    /// 会话已经结束，正常关闭
+    Close,
+    /// 出错：把原因用 S_ERROR 帧发给客户端后再关闭
+    Error(String),
+}
+
+async fn handle_client_frame(session: &Arc<Session>, raw: &[u8]) -> FrameOutcome {
     let (kind, payload) = match proto::split(raw) {
         Some(v) => v,
-        None => return true,
+        None => return FrameOutcome::Continue,
     };
     match kind {
-        proto::C_INPUT => session.write_input(payload.to_vec()).await.is_ok(),
+        proto::C_INPUT => match session.write_input(payload.to_vec()).await {
+            Ok(()) => FrameOutcome::Continue,
+            // 写入超时：前台程序不读输入，PTY 缓冲区写满了。
+            // 这时必须告诉用户原因，否则表现就是「终端突然卡死」。
+            Err(e) => {
+                if session.is_alive() {
+                    FrameOutcome::Error(e)
+                } else {
+                    // 会话本身已经结束（例如进程刚退出），正常关闭即可
+                    FrameOutcome::Close
+                }
+            }
+        },
         proto::C_RESIZE => {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-                let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+                // 用 try_from + clamp，而不是 `as u16`：
+                // `as u16` 会把 70000 截断成 4464，把 PTY 设成几千列。
+                let cols = v
+                    .get("cols")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|x| u16::try_from(x).ok())
+                    .unwrap_or(80)
+                    .clamp(1, MAX_COLS);
+                let rows = v
+                    .get("rows")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|x| u16::try_from(x).ok())
+                    .unwrap_or(24)
+                    .clamp(1, MAX_ROWS);
                 session.resize(cols, rows);
             }
-            true
+            FrameOutcome::Continue
         }
         proto::C_SIGNAL => {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
@@ -475,9 +574,9 @@ async fn handle_client_frame(session: &Arc<Session>, raw: &[u8]) -> bool {
                     send_signal(session, sig);
                 }
             }
-            true
+            FrameOutcome::Continue
         }
-        _ => true,
+        _ => FrameOutcome::Continue,
     }
 }
 
@@ -511,6 +610,9 @@ async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
     if rel.is_empty() || rel == "index.html" {
         return serve_index(&state);
     }
+    // URL 里的路径是百分号编码的：文件名里带编码字符的资源要解码后才找得到。
+    // 解码后的路径依然交给 resolve_asset 做组件级校验（`..` 会被拒绝）。
+    let rel = percent_decode(&rel);
     match resolve_asset(&state.cfg.ui_dir, &rel) {
         Some((full, _)) => match std::fs::read(&full) {
             Ok(bytes) => {
@@ -542,11 +644,14 @@ fn serve_index(state: &Arc<AppState>) -> Response {
     let template = match std::fs::read_to_string(&index_path) {
         Ok(t) => t,
         Err(e) => {
+            // 注意：不要把服务器上的绝对路径写进响应体（信息泄露），
+            // 只在服务端日志里记录细节。
+            crate::log_error!("读取前端 index.html 失败: {} ({})", index_path.display(), e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("前端资源缺失: {} ({})", index_path.display(), e),
+                "前端资源缺失，请检查应用安装是否完整".to_string(),
             )
-                .into_response()
+                .into_response();
         }
     };
     let base = state.base_raw();
@@ -564,6 +669,30 @@ fn serve_index(state: &Arc<AppState>) -> Response {
         html,
     )
         .into_response()
+}
+
+/// 百分号解码（只处理 %XX，不把 `+` 当空格）。
+///
+/// URL 路径里的文件名可能是编码过的（中文、空格等），
+/// 不解码就会 404。解码后的结果仍然要过 `resolve_asset` 的路径穿越校验。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 把 URL 路径安全映射到 ui_dir 下的文件，阻断路径穿越。
@@ -630,4 +759,26 @@ pub fn dev_addr(cfg: &Config) -> Option<SocketAddr> {
     let port = cfg.dev_port?;
     let host = cfg.dev_host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     format!("{}:{}", host, port).parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_decodes_hex_escapes() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn percent_decode_leaves_plus_and_broken_escapes() {
+        // '+' 在路径里是字面加号，不能当空格
+        assert_eq!(percent_decode("a+b"), "a+b");
+        // 不完整 / 非法的转义保持原样
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%4"), "%4");
+    }
 }

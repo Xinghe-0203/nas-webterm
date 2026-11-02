@@ -261,7 +261,10 @@ export class TerminalSession {
 
     ws.onopen = () => {
       if (!isCurrent()) return;
-      this.retry = 0;
+      // 注意：**这里不重置退避计数**。
+      // 只有真正收到 S_READY（服务端认了这个会话）才算一次成功的连接。
+      // 如果握手成功就归零，遇到「服务端接受后立刻断开」的情况
+      // 退避会永远停在 500ms，多个标签页就是每秒两次的握手风暴。
       this.setState('online');
       if (this.lastCols) this.sendResize(this.lastCols, this.lastRows);
     };
@@ -279,6 +282,8 @@ export class TerminalSession {
           const info = JSON.parse(new TextDecoder().decode(payload)) as ReadyInfo;
           this.sid = info.sid;
           this.exited = false;
+          // 真的连上了（服务端认了这个会话）：退避归零
+          this.retry = 0;
           // 重连到全屏 TUI：回放里如果没带「进入备用屏幕」那个起点，
           // 客户端要先切进去，否则 TUI 的重绘会画到主屏上，画面全乱。
           if (info.needAltEnter) {
@@ -301,6 +306,14 @@ export class TerminalSession {
         }
         this.exited = true;
         this.opts.onExit?.({ code, signal });
+        // 进程已经退出：主动断开。
+        // 服务端此时也会释放这个会话的客户端连接，
+        // 不主动断开的话，这个死会话会一直占着服务端的名额。
+        try {
+          this.ws?.close();
+        } catch {
+          /* ignore */
+        }
       } else if (kind === S_ERROR) {
         this.handleServerError(payload);
       }
@@ -363,18 +376,38 @@ export class TerminalSession {
       }
       this.ws = null;
     }
-    if (this.sid) {
-      try {
-        await fetch(`${this.opts.base}api/sessions/${encodeURIComponent(this.sid)}`, {
-          method: 'DELETE',
-          credentials: 'same-origin',
-        });
-      } catch {
-        /* ignore */
-      }
+    const sid = this.sid;
+    this.sid = null;
+    if (sid) {
+      await this.deleteSession(sid);
     }
     // 完整释放：观察器、终端实例、未写出的输出缓冲
     this.release();
+  }
+
+  /**
+   * 删除服务端会话（关掉标签页 / 重启时用）。
+   *
+   * 会话删不掉是有代价的：服务端只在「有空闲回收时间」或者「客户端都断开
+   * 且会话已结束」时才会回收它。删不掉就会一直占着 max_sessions 的名额，
+   * 几个标签页就能把名额占满，整个应用变成 429。
+   * 所以这里失败要重试；404 说明会话本来就不存在，同样算成功。
+   */
+  private async deleteSession(sid: string): Promise<boolean> {
+    const url = `${this.opts.base}api/sessions/${encodeURIComponent(sid)}`;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const res = await fetch(url, {
+          method: 'DELETE',
+          credentials: 'same-origin',
+        });
+        if (res.ok || res.status === 404) return true;
+      } catch {
+        /* 网络抖动，退避后重试 */
+      }
+      await new Promise((r) => window.setTimeout(r, 300 * (attempt + 1)));
+    }
+    return false;
   }
 
   dispose(): void {
@@ -427,9 +460,17 @@ export class TerminalSession {
         /* ignore */
       }
     }
+    // 旧会话必须删掉。
+    // 只把 sid 置空然后重连的话，旧会话会留在服务端没人认领：
+    // 服务端的空闲回收要靠 idle-minutes（默认 0 = 不回收），
+    // 点几次「重启」就把 max_sessions 的名额占满，之后谁也建不了会话。
+    const oldSid = this.sid;
+    this.sid = null;
+    if (oldSid) {
+      void this.deleteSession(oldSid);
+    }
     // 用户主动重启 = 重新给一次机会（之前可能是被服务端拒绝的）
     this.fatal = false;
-    this.sid = null;
     this.exited = false;
     this.retry = 0;
     this.release();

@@ -58,7 +58,9 @@ export TRIM_APPDEST="${TMP_DIR}/target"
 export TRIM_PKGVAR="${TMP_DIR}/var"
 export TRIM_PKGHOME="${TMP_DIR}/home"
 export TRIM_PKGTMP="${TMP_DIR}/tmp"
-export TRIM_APPVER="1.0.0"
+# 版本号从 manifest 读取，避免每次发版都要改测试脚本
+APP_VERSION="$(awk -F'=' '/^[[:space:]]*version[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "${ROOT}/manifest")"
+export TRIM_APPVER="${APP_VERSION:-1.0.0}"
 export TRIM_USERNAME=""
 export TRIM_GID=""
 

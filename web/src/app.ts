@@ -476,11 +476,16 @@ export class App {
     if (this.persistTimer !== null) window.clearTimeout(this.persistTimer);
     this.persistTimer = window.setTimeout(() => {
       this.persistTimer = null;
-      const data: PersistedTab[] = this.tabs.map((t) => ({
-        sid: t.session.sid,
-        cmd: t.cmd,
-        title: t.title,
-      }));
+      // 只持久化**已经拿到 sid** 的标签页。
+      // 刚建好、还没收到 S_READY 的标签页 sid 是 null：如果这时候刷新页面，
+      // 恢复时会新建一个会话，原来那个没人认领、也不会被回收，成了孤儿会话。
+      const data: PersistedTab[] = this.tabs
+        .filter((t) => !!t.session.sid)
+        .map((t) => ({
+          sid: t.session.sid,
+          cmd: t.cmd,
+          title: t.title,
+        }));
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
       } catch {

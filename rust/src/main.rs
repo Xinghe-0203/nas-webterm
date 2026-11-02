@@ -15,6 +15,7 @@ mod web;
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +83,7 @@ async fn run(cfg: Config) -> Result<(), String> {
     let state = Arc::new(AppState {
         mgr: mgr.clone(),
         cfg: cfg.clone(),
+        started_at: std::time::Instant::now(),
     });
     let app = web::router(state);
 
@@ -116,8 +118,35 @@ async fn run(cfg: Config) -> Result<(), String> {
                 .map_err(|e| format!("创建目录 {} 失败: {}", parent.display(), e))?;
         }
     }
-    // 清掉上次残留的 socket
-    let _ = std::fs::remove_file(&socket_path);
+    // 清掉上次残留的 socket。
+    // 注意：只删「确实是 socket」的东西——直接 remove_file 会把该路径上的
+    // 普通文件/符号链接目标一起删掉，配错了路径就可能误删用户文件。
+    match std::fs::symlink_metadata(&socket_path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+        Ok(meta) => {
+            if !meta.file_type().is_symlink() {
+                return Err(format!(
+                    "{} 已存在且不是 socket，拒绝启动",
+                    socket_path.display()
+                ));
+            }
+            // 符号链接：指向的必须也是 socket，否则同样拒绝。
+            match std::fs::metadata(&socket_path) {
+                Ok(target) if target.file_type().is_socket() => {
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+                _ => {
+                    return Err(format!(
+                        "{} 已存在且不是 socket，拒绝启动",
+                        socket_path.display()
+                    ));
+                }
+            }
+        }
+        Err(_) => {}
+    }
 
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .map_err(|e| format!("监听 {} 失败: {}", socket_path.display(), e))?;

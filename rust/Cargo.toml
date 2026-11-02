@@ -1,6 +1,6 @@
 [package]
 name = "nas-webterm"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "飞牛 NAS 浏览器多标签页 Web 终端（root PTY）"
 license = "MIT"
