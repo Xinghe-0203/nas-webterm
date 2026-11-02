@@ -34,6 +34,27 @@ const CLIENT_QUEUE: usize = 512;
 const READ_BUF: usize = 16 * 1024;
 /// 输入队列容量
 const INPUT_QUEUE: usize = 1024;
+/// 备用屏幕序列的最大长度（`ESC[?1049h` = 8 字节）。
+/// 跨读块边界时要把上一块尾部这么多字节带过来拼接。
+const MAX_ALT_SEQ_LEN: usize = 8;
+/// 会话数超限错误的固定前缀。
+///
+/// HTTP 层靠它区分「容量满」和其它错误：容量满要给 429 + 明确文案，
+/// 前端据此停止重连（否则会无限指数重试，终端永远 offline）。
+pub const LIMIT_ERR_PREFIX: &str = "会话数已达上限";
+
+/// 生成「会话数已达上限」错误。
+pub fn limit_error(max: usize) -> String {
+    format!(
+        "{}（{} 个），请先关闭一个标签页再新建",
+        LIMIT_ERR_PREFIX, max
+    )
+}
+
+/// 判断错误是不是「会话数已达上限」。
+pub fn is_limit_error(e: &str) -> bool {
+    e.starts_with(LIMIT_ERR_PREFIX)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExitInfo {
@@ -86,6 +107,8 @@ pub struct Session {
     alt_screen: AtomicBool,
     /// 最近一次进入备用屏幕的位置（回放缓冲区内的下标）
     alt_enter_idx: AtomicUsize,
+    /// 上一次读块尾部残留的字节（用于跨块识别转义序列）
+    alt_tail: Mutex<Vec<u8>>,
     alive: AtomicBool,
     first_output: AtomicBool,
     last_active: Mutex<Instant>,
@@ -153,6 +176,7 @@ impl Session {
             exit: Mutex::new(None),
             alt_screen: AtomicBool::new(false),
             alt_enter_idx: AtomicUsize::new(usize::MAX),
+            alt_tail: Mutex::new(Vec::new()),
             alive: AtomicBool::new(true),
             first_output: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
@@ -250,14 +274,27 @@ impl Session {
                 // 所以在硬上限之前先不裁，保留完整的一次 TUI 会话。
                 let alt_would_be_cut = alt_idx != usize::MAX && alt_idx < excess;
                 if !(alt_would_be_cut && replay.len() < REPLAY_HARD_CAP) {
-                    replay.drain(..excess);
+                    // 裁剪点必须落在转义序列边界上，否则客户端会把半条序列
+                    // 当成普通文本打印出来（README §7 承诺按序列边界裁剪）。
+                    // 判断不出来时退回按字节裁，保证缓冲区不会无限增长。
+                    let cut = match safe_cut_point(&replay, excess) {
+                        Some(c) => c,
+                        None => {
+                            crate::log_warn!(
+                                "会话 {} 的回放缓冲区头部存在无法识别的转义序列，按字节裁剪",
+                                self.id
+                            );
+                            excess
+                        }
+                    };
+                    replay.drain(..cut);
                     let idx = self.alt_enter_idx.load(Ordering::Relaxed);
-                    self.alt_enter_idx
-                        .store(idx.saturating_sub(excess), Ordering::Relaxed);
-                    if self.alt_enter_idx.load(Ordering::Relaxed) == usize::MAX {
-                        // 备用屏幕起点已被裁掉，客户端需要自己补一个
-                        self.alt_enter_idx.store(usize::MAX, Ordering::Relaxed);
-                    }
+                    let new_idx = if idx == usize::MAX {
+                        usize::MAX
+                    } else {
+                        idx.saturating_sub(cut)
+                    };
+                    self.alt_enter_idx.store(new_idx, Ordering::Relaxed);
                 }
             }
             replay.len() - data.len()
@@ -266,7 +303,16 @@ impl Session {
         let frame = Bytes::from(proto::frame(proto::S_OUTPUT, &data));
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         // 队列满说明客户端消费不过来，直接断开让它重连并回放，避免拖慢其它标签页。
+        let before = clients.len();
         clients.retain(|(_, tx)| tx.try_send(frame.clone()).is_ok());
+        let dropped = before - clients.len();
+        if dropped > 0 {
+            crate::log_warn!(
+                "会话 {} 有 {} 个客户端消费不过来，已断开（请重连回放）",
+                self.id,
+                dropped
+            );
+        }
     }
 
     /// 扫描输出，跟踪是否进入了/离开了备用屏幕。
@@ -274,13 +320,26 @@ impl Session {
     /// 全屏 TUI 程序会切到备用屏幕并持续重绘。
     /// 这些重绘字节如果原样回放，轻则画面错乱，重则被 256KB 上限截断在
     /// 转义序列中间，把终端状态彻底搞坏。所以必须知道当前处于哪种模式。
+    ///
+    /// **跨块处理**：`ESC[?1049h` 有 8 字节，PTY 一次读出来的块边界完全可能
+    /// 把它劈成两半。只在单块里扫会漏判备用屏幕状态，重连后 TUI 画面就乱/空白。
+    /// 所以这里把上一块尾部（最多 `MAX_ALT_SEQ_LEN - 1` 字节）带过来一起扫。
     fn detect_alt_screen(&self, chunk: &[u8], base: usize) {
+        let tail = {
+            let mut t = self.alt_tail.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *t)
+        };
+        let tail_len = tail.len();
+        let mut buf: Vec<u8> = Vec::with_capacity(tail_len + chunk.len());
+        buf.extend_from_slice(&tail);
+        buf.extend_from_slice(chunk);
+
         let mut pos = 0usize;
-        while pos < chunk.len() {
+        while pos < buf.len() {
             let mut hit: Option<(usize, usize, bool)> = None; // (位置, 长度, 是否进入)
             for (seqs, entering) in [(ALT_ENTER, true), (ALT_LEAVE, false)] {
                 for seq in seqs {
-                    if let Some(i) = find_bytes(&chunk[pos..], seq) {
+                    if let Some(i) = find_bytes(&buf[pos..], seq) {
                         let at = pos + i;
                         if hit.map_or(true, |(b, _, _)| at < b) {
                             hit = Some((at, seq.len(), entering));
@@ -291,14 +350,24 @@ impl Session {
             let Some((at, len, entering)) = hit else { break };
             if entering {
                 self.alt_screen.store(true, Ordering::Relaxed);
-                self.alt_enter_idx
-                    .store(base + at, Ordering::Relaxed);
+                // at 可能落在上一块残留的尾巴里，换算回回放缓冲区的绝对下标
+                let abs = if at >= tail_len {
+                    base + (at - tail_len)
+                } else {
+                    base.saturating_sub(tail_len - at)
+                };
+                self.alt_enter_idx.store(abs, Ordering::Relaxed);
             } else {
                 self.alt_screen.store(false, Ordering::Relaxed);
                 self.alt_enter_idx.store(usize::MAX, Ordering::Relaxed);
             }
             pos = at + len;
         }
+
+        // 留住尾巴，下一块接着用
+        let keep = buf.len().min(MAX_ALT_SEQ_LEN - 1);
+        let mut t = self.alt_tail.lock().unwrap_or_else(|e| e.into_inner());
+        *t = buf[buf.len() - keep..].to_vec();
     }
 
     /// 子进程退出：记录退出码并通知客户端。
@@ -404,6 +473,7 @@ impl Session {
     /// 结束会话：先杀进程组，再杀子进程。
     pub fn kill(&self) {
         self.alive.store(false, Ordering::Relaxed);
+        crate::log_info!("会话 {} 已结束 (pid={})", self.id, self.pid.unwrap_or(0));
         if let Some(mut killer) = self.killer.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = killer.kill();
         }
@@ -495,22 +565,40 @@ impl SessionManager {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<Session>, String> {
-        // 容量上限只拦新建，绝不为腾位置去杀用户正在用的旧会话
+        // 快路径：容量已满时直接拒绝，不去白创建一个 PTY 进程。
         {
             let guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if guard.len() >= self.cfg.max_sessions {
-                return Err(format!(
-                    "会话数已达上限（{} 个），请先关闭一个标签页再新建",
-                    self.cfg.max_sessions
-                ));
+                return Err(limit_error(self.cfg.max_sessions));
             }
         }
         let id = self.next_id();
         let session = Session::spawn(&self.cfg, id.clone(), cols, rows, startup)?;
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, session.clone());
+        // 权威判断：创建 PTY 需要时间，这期间可能有别的请求把名额占满，
+        // 所以「检查 + 插入」必须在同一个临界区里，否则并发下会突破上限。
+        {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() >= self.cfg.max_sessions {
+                drop(guard);
+                // 名额没了：刚创建的进程不能留着白占资源
+                session.kill();
+                crate::log_warn!(
+                    "会话数已达上限（{} 个），拒绝创建新会话 {}",
+                    self.cfg.max_sessions,
+                    id
+                );
+                return Err(limit_error(self.cfg.max_sessions));
+            }
+            guard.insert(id.clone(), session.clone());
+        }
+        crate::log_info!(
+            "会话已创建：{} (pid={}, shell={}, {}x{})",
+            id,
+            session.pid.unwrap_or(0),
+            session.shell,
+            cols,
+            rows
+        );
         Ok(session)
     }
 
@@ -647,56 +735,136 @@ fn trim_to_safe(buf: &[u8]) -> Vec<u8> {
 
     // 1) 尾部若还有半条转义序列，丢掉
     if let Some(esc) = buf.iter().rposition(|b| *b == 0x1b) {
-        if !sequence_complete(&buf[esc..]) {
+        if sequence_complete(&buf[esc..]) {
+            // 序列完整，但结尾可能还带着半个 UTF-8 字符（下面统一处理）
+        } else {
             end = esc;
         }
     }
 
     // 2) 尾部若还有不完整的 UTF-8 字符，也丢掉
-    let mut start = end;
-    while start > 0 && (buf[start - 1] & 0xC0) == 0x80 {
-        start -= 1;
-    }
-    if start < end {
-        let lead = buf[start - 1];
-        let need = if lead < 0x80 {
-            1
-        } else if lead >= 0xF0 {
-            4
-        } else if lead >= 0xE0 {
-            3
-        } else if lead >= 0xC0 {
-            2
+    //
+    // 注意：这里必须处理「缓冲区尾部全是续字节」的情况。
+    // 旧实现先回退到 start，再取 buf[start - 1]——当整段都是续字节时
+    // start 会退到 0，buf[start - 1] 直接下溢 panic。
+    // release 配置是 panic = "abort"，一次越界就会让整个服务挂掉。
+    if end > 0 {
+        let (lead_idx, cont) = last_char_span(&buf[..end]);
+        if cont > 0 {
+            // 尾部是一串续字节
+            if lead_idx == 0 {
+                // 整段都找不到起始字节：不是合法的 UTF-8，全部丢掉
+                end = 0;
+            } else {
+                let lead = buf[lead_idx - 1];
+                let need = utf8_seq_len(lead);
+                let have = 1 + cont;
+                if need <= 1 {
+                    // 前一个字节不是多字节起始：这些续字节是孤儿，丢掉
+                    end = lead_idx;
+                } else if have < need {
+                    // 字符被截断：从它的起始字节开始丢掉
+                    end = lead_idx - 1;
+                }
+                // have >= need：字符完整，保留
+            }
         } else {
-            1
-        };
-        if start - 1 + need > end {
-            end = start - 1;
+            // 最后一个字节不是续字节：要么是 ASCII，要么是个孤立的起始字节
+            let lead = buf[end - 1];
+            let need = utf8_seq_len(lead);
+            if need > 1 {
+                // 起始字节后面没有续字节：字符被截断，丢掉这个字节
+                end -= 1;
+            }
         }
     }
 
     buf[..end].to_vec()
 }
 
+/// UTF-8 起始字节对应的字符长度；不是合法起始字节返回 0。
+fn utf8_seq_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    }
+}
+
+/// 找出缓冲区最后一个字符的起点。
+///
+/// 返回 (续字节起点, 续字节个数)：
+/// - 续字节个数为 0 → 最后一个字节不是续字节（ASCII 或孤立起始字节）；
+/// - 续字节起点为 0 → 整段都是续字节，找不到合法起点。
+fn last_char_span(buf: &[u8]) -> (usize, usize) {
+    let mut i = buf.len();
+    let mut cont = 0usize;
+    while i > 0 && (buf[i - 1] & 0xC0) == 0x80 {
+        i -= 1;
+        cont += 1;
+    }
+    (i, cont)
+}
+
 /// 判断一段以 ESC 开头的字节是否是完整的转义序列。
 fn sequence_complete(tail: &[u8]) -> bool {
+    sequence_end(tail).is_some()
+}
+
+/// 找到以 ESC 开头的转义序列的结尾字节下标（相对 tail 的偏移）。
+///
+/// 找不到结尾说明序列还没写完（跨块了）。
+fn sequence_end(tail: &[u8]) -> Option<usize> {
     if tail.len() < 2 {
-        return false;
+        return None;
     }
     match tail[1] {
         b'[' => {
             // CSI：以 0x40..=0x7E 结尾
             tail[2..]
                 .iter()
-                .any(|b| (0x40..=0x7e).contains(b))
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map(|i| 2 + i)
         }
         b']' => {
             // OSC：以 BEL 或 ST(ESC \) 结尾
-            tail[2..].windows(2).any(|w| w == b"\x1b\\")
-                || tail[2..].contains(&0x07)
+            if let Some(i) = tail[2..].windows(2).position(|w| w == b"\x1b\\") {
+                Some(2 + i + 1)
+            } else {
+                tail[2..].iter().position(|b| *b == 0x07).map(|i| 2 + i)
+            }
         }
-        _ => true, // 两字节的简单序列
+        _ => Some(1), // 两字节的简单序列
     }
+}
+
+/// 找一个可以安全裁剪的位置：保证裁剪点不落在一条转义序列中间。
+///
+/// `from` 是期望的裁剪点。如果它落在某条转义序列中间，就往后推到该序列的
+/// 结尾之后。实在判断不出来（返回 None）时由调用方决定退路。
+fn safe_cut_point(buf: &[u8], from: usize) -> Option<usize> {
+    if from == 0 {
+        return Some(0);
+    }
+    if from >= buf.len() {
+        return Some(buf.len());
+    }
+    // 只在 from 之前的一小段窗口里找 ESC：转义序列都很短，
+    // 窗口内没有 ESC 就说明 from 落在普通文本里，可以直接裁。
+    const WINDOW: usize = 512;
+    let lo = from.saturating_sub(WINDOW);
+    let Some(rel) = buf[lo..from].iter().rposition(|b| *b == 0x1b) else {
+        return Some(from);
+    };
+    let esc = lo + rel;
+    // 这条序列在 from 之前已经结束 → from 是安全的裁剪点
+    if sequence_complete(&buf[esc..from]) {
+        return Some(from);
+    }
+    // 序列跨过了 from：把裁剪点推到序列之后
+    sequence_end(&buf[esc..]).map(|end| (esc + end + 1).min(buf.len()))
 }
 
 /// 解析 /proc/<pid>/stat 中的进程组号。
@@ -852,4 +1020,94 @@ fn detect_locale() -> String {
             "C.UTF-8".to_string()
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_error_is_detectable() {
+        let msg = limit_error(32);
+        assert!(is_limit_error(&msg), "应识别为容量错误: {msg}");
+        assert!(msg.contains("32"));
+        assert!(!is_limit_error("创建 PTY 失败: failed to openpty"));
+        assert!(!is_limit_error(""));
+    }
+
+    #[test]
+    fn trim_keeps_complete_text() {
+        let buf = b"hello world".to_vec();
+        assert_eq!(trim_to_safe(&buf), buf);
+    }
+
+    #[test]
+    fn trim_drops_incomplete_escape_sequence() {
+        // ESC[2 还没写完 → 整条丢掉
+        let buf = b"abc\x1b[2".to_vec();
+        assert_eq!(trim_to_safe(&buf), b"abc".to_vec());
+    }
+
+    #[test]
+    fn trim_drops_incomplete_utf8() {
+        // “中”只写了 2 个字节
+        let mut buf = b"ok".to_vec();
+        buf.extend_from_slice(&[0xE4, 0xB8]);
+        assert_eq!(trim_to_safe(&buf), b"ok".to_vec());
+    }
+
+    #[test]
+    fn trim_drops_lone_lead_byte() {
+        let mut buf = b"ok".to_vec();
+        buf.push(0xE4);
+        assert_eq!(trim_to_safe(&buf), b"ok".to_vec());
+    }
+
+    #[test]
+    fn trim_does_not_panic_on_continuation_bytes_only() {
+        // 旧实现在这里会 buf[start - 1] 下溢 panic（release 下 panic=abort 直接挂服务）
+        let buf = vec![0x80u8; 16];
+        assert_eq!(trim_to_safe(&buf), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn trim_keeps_valid_multibyte() {
+        let mut buf = b"ok".to_vec();
+        buf.extend_from_slice("中".as_bytes());
+        assert_eq!(trim_to_safe(&buf), buf);
+    }
+
+    #[test]
+    fn cut_point_avoids_splitting_sequences() {
+        let mut buf = b"abcdefgh".to_vec();
+        buf.extend_from_slice(b"\x1b[2J");
+        buf.extend_from_slice(b"tail");
+        // from 落在 ESC[2J 中间 → 必须推到序列之后
+        let cut = safe_cut_point(&buf, 9).unwrap();
+        assert_eq!(cut, 12);
+        assert!(buf[cut..].starts_with(b"tail"));
+    }
+
+    #[test]
+    fn cut_point_plain_text_is_unchanged() {
+        let buf = b"abcdefghij".to_vec();
+        assert_eq!(safe_cut_point(&buf, 4).unwrap(), 4);
+    }
+
+    #[test]
+    fn sequence_end_detects_csi_and_osc() {
+        assert_eq!(sequence_end(b"\x1b[2J"), Some(3));
+        assert_eq!(sequence_end(b"\x1b[?"), None);
+        assert_eq!(sequence_end(b"\x1b]0;title\x07"), Some(9));
+        // OSC 以 ST(ESC \) 结尾：最后一个字节是 '\'（下标 10）
+        assert_eq!(sequence_end(b"\x1b]0;title\x1b\\"), Some(10));
+    }
+
+    #[test]
+    fn trim_drops_orphan_continuation_bytes() {
+        // 'k' 后面跟了一个没有起始字节的续字节 → 孤儿字节丢掉
+        let mut buf = b"ok".to_vec();
+        buf.push(0x80);
+        assert_eq!(trim_to_safe(&buf), b"ok".to_vec());
+    }
 }

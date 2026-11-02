@@ -112,6 +112,11 @@ CARGO="$(find_cargo || true)"
 
 export PATH="$(dirname "${CARGO}"):${PATH}"
 
+# rustc 与 cargo 同一个目录；找不到就用 PATH 里的
+RUSTC="$(dirname "${CARGO}")/rustc"
+[ -x "${RUSTC}" ] || RUSTC="$(command -v rustc 2>/dev/null || true)"
+[ -n "${RUSTC}" ] || fail "未找到 rustc，请检查 Rust 工具链安装是否完整"
+
 # ---------------------------------------------------------------------------
 step "1/9 清理旧产物"
 find "${ROOT}" -name '.DS_Store' -delete
@@ -125,16 +130,24 @@ step "2/9 编译 Rust 后端"
 build_arch() {
     local target="$1" out="$2" cross_cc="$3"
     echo "--- 编译 ${target} ---"
-    if [ "${target}" = "x86_64-unknown-linux-gnu" ]; then
-        if ! rustup target list --installed 2>/dev/null | grep -qx "${target}"; then
+    # 目标标准库是否就绪。
+    # 不直接依赖 rustup 的记账：有些环境的 rustup 元数据是坏的（半途安装失败），
+    # 但 sysroot 里其实已经有这个目标的标准库，直接看目录更可靠。
+    target_ready() {
+        local libdir
+        libdir="$("${RUSTC}" --print target-libdir --target "${target}" 2>/dev/null)" || return 1
+        [ -n "${libdir}" ] && [ -d "${libdir}" ]
+    }
+    if ! target_ready; then
+        if command -v rustup >/dev/null 2>&1; then
             rustup target add "${target}" >/dev/null 2>&1 || true
         fi
+    fi
+    target_ready || fail "缺少 Rust 目标 ${target} 的标准库（rustup target add ${target}）"
+    if [ "${target}" = "x86_64-unknown-linux-gnu" ]; then
         (cd "${ROOT}/rust" && "${CARGO}" build --release --target "${target}" >/dev/null) ||
             fail "编译 ${target} 失败"
     else
-        if ! rustup target list --installed 2>/dev/null | grep -qx "${target}"; then
-            rustup target add "${target}" >/dev/null 2>&1 || fail "添加 Rust 目标 ${target} 失败"
-        fi
         command -v "${cross_cc}" >/dev/null 2>&1 ||
             fail "缺少交叉编译器 ${cross_cc}，请安装 gcc-aarch64-linux-gnu"
         local cc_var

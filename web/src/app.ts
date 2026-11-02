@@ -31,6 +31,8 @@ export interface AppOptions {
 export class App {
   private base: string;
   private fontSize: number;
+  /** 初始字号：Ctrl+0 复位到这里（而不是写死的 14） */
+  private initialFontSize: number;
   private startupCommand: string;
   private tabs: Tab[] = [];
   private activeIndex = -1;
@@ -46,6 +48,7 @@ export class App {
   constructor(opts: AppOptions) {
     this.base = opts.base;
     this.fontSize = opts.fontSize ?? 14;
+    this.initialFontSize = this.fontSize;
     this.startupCommand = opts.startupCommand ?? '';
   }
 
@@ -53,13 +56,49 @@ export class App {
     this.bindGlobalEvents();
     // 暴露给自动化验证脚本（页面本身仅管理员可见）
     (window as unknown as { __webterm__?: App }).__webterm__ = this;
-    void this.loadServerConfig();
+    void this.bootstrap();
+  }
+
+  /**
+   * 启动流程：先拿到服务端的会话上限和现存会话，再恢复标签页。
+   *
+   * 顺序很重要：恢复标签页时如果带着一个**已经不存在的 sid**，
+   * 服务端的 WS 处理会当成「新建会话」，于是每恢复一个标签页就多占一个
+   * 会话名额；恢复 8 个标签页就能把 max_sessions 撑爆，新标签页全部失败。
+   */
+  private async bootstrap(): Promise<void> {
+    await this.loadServerConfig();
+    const live = await this.loadServerSessions();
+
     const restored = this.restore();
-    if (restored.length === 0) {
-      this.createTab(this.defaultCommand());
-    } else {
-      for (const t of restored) this.createTab(t.cmd, t.sid, t.title);
+    let used = live.size;
+    let skipped = 0;
+
+    for (const t of restored) {
+      if (t.sid && live.has(t.sid)) {
+        // 会话还在：直接接回去（复用已有会话，不占新名额）
+        this.createTab(t.cmd, t.sid, t.title);
+        continue;
+      }
+      // 会话已经没了：要重新开一个，但先看还有没有名额
+      if (this.maxSessions && used >= this.maxSessions) {
+        skipped += 1;
+        continue;
+      }
+      this.createTab(t.cmd, null, t.title);
+      used += 1;
     }
+
+    if (this.tabs.length === 0) {
+      this.createTab(this.defaultCommand());
+    }
+    if (skipped > 0) {
+      this.writeSystem(
+        this.activeIndex,
+        `\r\n\x1b[33m有 ${skipped} 个标签页因会话数已达上限（${this.maxSessions} 个）未能恢复。\x1b[0m\r\n`,
+      );
+    }
+
     const wanted = this.tabFromHash();
     const idx = wanted >= 0 ? wanted : 0;
     this.activate(Math.min(idx, this.tabs.length - 1));
@@ -76,6 +115,24 @@ export class App {
       if (json?.ok) this.maxSessions = Number(json.data?.maxSessions ?? 0);
     } catch {
       /* 拿不到就不做上限预检 */
+    }
+  }
+
+  /** 读取服务端现存的会话 id 集合。 */
+  private async loadServerSessions(): Promise<Set<string>> {
+    try {
+      const res = await fetch(`${this.base}api/sessions`, { credentials: 'same-origin' });
+      const json = await res.json();
+      const list = Array.isArray(json?.data) ? json.data : [];
+      return new Set(
+        list
+          .map((s: { id?: string; alive?: boolean }) =>
+            s?.alive === false ? '' : (s?.id ?? ''),
+          )
+          .filter((id: string) => id.length > 0),
+      );
+    } catch {
+      return new Set();
     }
   }
 
@@ -156,6 +213,21 @@ export class App {
         }
       },
       onState: (state) => this.onStateChange(id, state),
+      onError: (message, code) => {
+        // 服务端明确拒绝（例如会话数已达上限）：把原因显示出来，
+        // 并点亮状态点提示这个标签页当前不可用。
+        this.dotElOf(id)?.classList.add('on');
+        const idx = this.tabs.findIndex((t) => t.id === id);
+        if (idx >= 0) {
+          this.writeSystem(
+            idx,
+            `\r\n\x1b[31m${message}\x1b[0m\r\n` +
+              (code === 'session_limit'
+                ? '\x1b[90m可关闭不用的标签页后重试，或点击标签页上的圆点重启。\x1b[0m\r\n'
+                : ''),
+          );
+        }
+      },
     });
 
     const tab: Tab = { id, session, el, panel, titleEl, dotEl, title: titleEl.textContent ?? '终端', cmd };
@@ -306,15 +378,23 @@ export class App {
             this.setFontSize(this.fontSize - 1);
           } else if (e.key === '0') {
             e.preventDefault();
-            this.setFontSize(14);
+            // 复位到初始字号，而不是写死的 14
+            this.setFontSize(this.initialFontSize);
           }
         }
       },
       true,
     );
 
-    // 飞牛桌面切换深浅色
+    // 飞牛桌面切换深浅色。
+    // 只接受同源消息，或来自父窗口/ opener 的消息（fnOS 桌面就是父窗口），
+    // 避免被任意第三方页面 postMessage 改掉配色。
     window.addEventListener('message', (event) => {
+      const trusted =
+        event.origin === location.origin ||
+        event.source === window.parent ||
+        event.source === window.opener;
+      if (!trusted) return;
       const data = event?.data;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'theme' || data.type === 'themeChange') {
@@ -324,6 +404,12 @@ export class App {
           for (const t of this.tabs) t.session.setTheme(theme);
         }
       }
+    });
+
+    // 标签页重新可见：把积压的输出刷出来，并同步一次尺寸
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      for (const t of this.tabs) t.session.onVisible();
     });
 
     window.addEventListener('beforeunload', () => {

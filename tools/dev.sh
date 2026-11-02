@@ -14,6 +14,13 @@ cd "${ROOT}"
 PORT="${DEV_PORT:-18086}"
 HOST="${DEV_HOST:-127.0.0.1}"
 BIN="${ROOT}/rust/target/release/nas-webterm"
+# build.sh 用 --target 编译，二进制落在 target/<triple>/release/ 下，这里一起兜底
+if [ ! -x "${BIN}" ]; then
+    HOST_TRIPLE="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+    if [ -n "${HOST_TRIPLE}" ] && [ -x "${ROOT}/rust/target/${HOST_TRIPLE}/release/nas-webterm" ]; then
+        BIN="${ROOT}/rust/target/${HOST_TRIPLE}/release/nas-webterm"
+    fi
+fi
 
 if [ ! -x "${BIN}" ]; then
     echo "未找到后端二进制，请先执行：cargo build --release（目录 ${ROOT}/rust）" >&2

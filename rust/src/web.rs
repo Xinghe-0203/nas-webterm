@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::proto;
-use crate::session::{Session, SessionManager};
+use crate::session::{self, Session, SessionManager};
 
 /// 网关心跳间隔：必须小于 nginx `proxy_read_timeout 300s`，否则空闲终端会被网关掐断。
 const HEARTBEAT: Duration = Duration::from_secs(20);
@@ -62,29 +62,61 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// 管理员校验：网关注入 X-Trim-Isadmin，非管理员直接 403。
+///
+/// 严格模式（`require_admin = true`，安装向导默认开启）下，
+/// **必须**拿到 `X-Trim-Isadmin: true` 才放行：
+/// 拿不到标记就等于无法证明调用者是管理员，不能因为「有用户名」就放行。
+/// 否则「严格校验管理员身份」这个开关等于形同虚设——任何能访问到 socket
+/// 的人只要伪造一个用户名头就能拿到 root shell。
 async fn admin_guard(State(state): State<Arc<AppState>>, req: axum::extract::Request, next: Next) -> Response {
     let headers = req.headers();
     let is_admin = headers.get("x-trim-isadmin");
     let username = headers.get("x-trim-username");
 
     let allowed = match is_admin {
-        Some(v) => v == "true" || v == "1",
+        Some(v) => v.as_bytes().eq_ignore_ascii_case(b"true") || v.as_bytes() == b"1",
         None => {
-            // 老版本网关只注入用户名，此时由网关自身的 isAdminOnly 规则兜底
-            if username.is_some() {
-                true
+            if state.cfg.require_admin {
+                // 严格模式：网关注入的管理员标记缺失 → 无法证明身份 → 拒绝
+                false
             } else {
-                !state.cfg.require_admin
+                // 非严格模式：只依赖网关自身的登录态与 isAdminOnly 规则兜底
+                true
             }
         }
     };
 
     if !allowed {
+        let user = username
+            .map(|v| v.to_str().unwrap_or("<invalid>"))
+            .unwrap_or("-");
+        crate::log_warn!(
+            "拒绝请求：需要管理员权限 (username={}, isadmin={}, require_admin={})",
+            user,
+            is_admin
+                .map(|v| v.to_str().unwrap_or("<invalid>"))
+                .unwrap_or("<缺失>"),
+            state.cfg.require_admin
+        );
+        // 区分两种拒绝原因，方便用户自己判断该找谁：
+        // - 网关明确说「不是管理员」→ 换管理员账号登录；
+        // - 网关没注入这个头 → 多半是网关行为异常，可在设置里关闭严格校验。
+        let (error, hint) = match is_admin {
+            Some(_) => (
+                "需要管理员权限才能使用 Web 终端",
+                "当前账号不是管理员",
+            ),
+            None => (
+                "需要管理员权限才能使用 Web 终端",
+                "网关未注入 X-Trim-Isadmin 头；若确认当前账号是管理员，可在「设置」里关闭「严格校验管理员身份」",
+            ),
+        };
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
                 "ok": false,
-                "error": "需要管理员权限才能使用 Web 终端"
+                "error": error,
+                "hint": hint
             })),
         )
             .into_response();
@@ -187,11 +219,21 @@ async fn create_session(
             "data": session.info(),
         }))
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({"ok": false, "error": e})),
-        )
-            .into_response(),
+        Err(e) => {
+            // 会话数达上限是可预期的业务状态，用 429 表达；
+            // 前端据此提示用户「先关掉一个标签页」，而不是当成故障无限重试。
+            let (status, code) = if session::is_limit_error(&e) {
+                (StatusCode::TOO_MANY_REQUESTS, "session_limit")
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            };
+            crate::log_warn!("创建会话失败: {}", e);
+            (
+                status,
+                axum::Json(serde_json::json!({"ok": false, "error": e, "code": code})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -239,11 +281,31 @@ async fn ws_handler(
             match state.mgr.create(startup, cols, rows) {
                 Ok(s) => s,
                 Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(serde_json::json!({"ok": false, "error": e})),
-                    )
-                        .into_response()
+                    // WebSocket 握手失败时浏览器拿不到 HTTP 状态码（只会看到
+                    // "connection failed"），前端只能盲目重连 → 无限重试。
+                    // 所以这里照样把连接建立起来，用 S_ERROR 帧把原因告诉前端，
+                    // 前端收到后停止重试并把原因显示出来。
+                    let (code, payload) = if session::is_limit_error(&e) {
+                        ("session_limit", e)
+                    } else {
+                        ("internal_error", e)
+                    };
+                    crate::log_warn!("WebSocket 会话创建失败 ({}): {}", code, payload);
+                    let msg = serde_json::to_vec(&serde_json::json!({
+                        "code": code,
+                        "error": payload,
+                    }))
+                    .unwrap_or_else(|_| b"{\"code\":\"internal_error\"}".to_vec());
+                    return ws
+                        .on_upgrade(move |mut socket| async move {
+                            let _ = socket
+                                .send(axum::extract::ws::Message::Binary(Bytes::from(
+                                    proto::frame(proto::S_ERROR, &msg),
+                                )))
+                                .await;
+                            let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+                        })
+                        .into_response();
                 }
             }
         }
@@ -282,6 +344,12 @@ async fn terminal_loop(
         session: session.clone(),
         cid,
     };
+    crate::log_info!(
+        "客户端已连接：会话 {} (pid={}, altScreen={})",
+        session.id,
+        session.pid.unwrap_or(0),
+        info.alt_screen
+    );
 
     // 就绪帧：altScreen 说明这是全屏 TUI，客户端要先进入备用屏幕再回放
     let ready = serde_json::json!({
@@ -382,6 +450,7 @@ async fn terminal_loop(
         }
     }
 
+    crate::log_info!("客户端已断开：会话 {}", session.id);
 }
 
 /// 处理客户端二进制帧。返回 false 表示应当断开。

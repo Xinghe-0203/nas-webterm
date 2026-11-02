@@ -16,8 +16,10 @@ pub const S_OUTPUT: u8 = 0x01;
 pub const S_EXIT: u8 = 0x02;
 /// 服务端 → 客户端：会话就绪，JSON `{"sid":"...","cols":N,"rows":N,...}`
 pub const S_READY: u8 = 0x03;
-/// 服务端 → 客户端：错误，JSON `{"message":"..."}`（保留用于协议扩展）
-#[allow(dead_code)]
+/// 服务端 → 客户端：错误，JSON `{"code":"...","error":"..."}`
+///
+/// 会话数达上限时服务端无法在握手阶段返回 HTTP 状态码（浏览器拿不到），
+/// 于是用这一帧把原因告诉前端，前端据此停止重连并显示提示。
 pub const S_ERROR: u8 = 0x04;
 
 /// 拼装一帧。

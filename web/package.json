@@ -1,7 +1,7 @@
 {
   "name": "nas-webterm-web",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,7 @@
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-unicode11": "^0.7.0",
     "@xterm/addon-webgl": "^0.18.0",
-    "@xterm/xterm": "^5.5.0"
+    "@xterm/xterm": "5.5.0"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

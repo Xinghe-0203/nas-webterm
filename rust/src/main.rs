@@ -41,7 +41,12 @@ fn main() {
         }
     };
 
-    log::init(cfg.log_file.as_deref());
+    // 收紧 umask：unix socket 创建瞬间的权限由 umask 决定，
+    // 默认 022 会让 socket 短暂变成 0755（其它本地用户能连上）。
+    // 这里在创建任何线程之前一次性设好，进程后续只创建 socket，不影响其它程序。
+    set_umask(0o077);
+
+    log::init_with_limit(cfg.log_file.as_deref(), cfg.log_max_bytes);
     log_info!(
         "nas-webterm {} 启动 (pid={}, shell={}, cwd={})",
         cfg.version,
@@ -126,6 +131,13 @@ async fn run(cfg: Config) -> Result<(), String> {
         .map_err(|e| format!("服务异常退出: {}", e))?;
     log_info!("nas-webterm 已停止");
     Ok(())
+}
+
+/// 设置进程 umask（只影响本进程创建的文件）。
+fn set_umask(mask: libc::mode_t) {
+    unsafe {
+        libc::umask(mask);
+    }
 }
 
 /// 设置 socket 权限与属组。

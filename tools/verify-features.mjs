@@ -36,6 +36,7 @@ const C_RESIZE = 0x02;
 const S_OUTPUT = 0x01;
 const S_EXIT = 0x02;
 const S_READY = 0x03;
+const S_ERROR = 0x04;
 
 const checks = [];
 function check(name, ok, detail = '') {
@@ -61,13 +62,14 @@ async function openSession({ cols = 100, rows = 30, cmd = null, sid = null } = {
   url.searchParams.set('rows', String(rows));
   const ws = new WebSocket(url.toString());
   ws.binaryType = 'arraybuffer';
-  const state = { out: '', ready: null, exit: null, ws };
+  const state = { out: '', ready: null, exit: null, error: null, ws };
   ws.addEventListener('message', async (e) => {
     const d = e.data instanceof Blob ? await e.data.arrayBuffer() : e.data;
     const b = Buffer.from(d);
     if (b[0] === S_OUTPUT) state.out += b.subarray(1).toString('utf8');
     else if (b[0] === S_READY) state.ready = JSON.parse(b.subarray(1).toString('utf8'));
     else if (b[0] === S_EXIT) state.exit = JSON.parse(b.subarray(1).toString('utf8'));
+    else if (b[0] === S_ERROR) state.error = JSON.parse(b.subarray(1).toString('utf8'));
   });
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve);
@@ -210,11 +212,14 @@ async function api(path, init) {
     }
     await sleep(500);
     const overflow = await openSession().catch(() => null);
-    if (overflow) {
+    // 服务端的拒绝方式：握手照常成功，但先下发 S_ERROR 帧再关闭连接
+    // （浏览器拿不到 WS 握手失败的状态码，那样前端只会盲目重连）。
+    if (overflow && overflow.error) {
       overflow.close();
-      check('H1 达到上限后拒绝新建', false, '仍然能创建新会话');
+      check('H1 达到上限后拒绝新建', true, `code=${overflow.error.code}`);
     } else {
-      check('H1 达到上限后拒绝新建', true, `上限=${maxSessions}`);
+      if (overflow) overflow.close();
+      check('H1 达到上限后拒绝新建', false, '仍然能创建新会话');
     }
     const still = await api('/api/sessions');
     check('H2 超限不会杀掉旧会话', (still.json?.data?.length ?? 0) >= maxSessions,

@@ -38,6 +38,8 @@ export interface TerminalSessionOpts {
   onExit?: (info: { code: number; signal: number | null }) => void;
   onTitle?: (title: string) => void;
   onState?: (state: ConnState) => void;
+  /** 服务端明确拒绝（会话数超限等）时回调：提示用户，且不再自动重连 */
+  onError?: (message: string, code: string) => void;
 }
 
 /** 终端未挂载时的输出缓冲上限（字节） */
@@ -100,10 +102,13 @@ export class TerminalSession {
   /** 服务端说这是全屏 TUI，客户端要先进入备用屏幕再回放 */
   private pendingAltEnter = false;
   private flushPending = false;
+  private flushTimer: number | null = null;
+  private flushUsesTimeout = false;
   private retry = 0;
   private retryTimer: number | null = null;
   private disposed = false;
-  private suppressRetry = false;
+  /** 服务端明确拒绝（如会话数超限）：不再自动重连，等用户处理 */
+  private fatal = false;
   private state: ConnState = 'offline';
   private lastCols = 0;
   private lastRows = 0;
@@ -228,7 +233,7 @@ export class TerminalSession {
 
   /** 建立（或重建）WebSocket 连接。 */
   connect(): void {
-    if (this.disposed || this.ws) return;
+    if (this.disposed || this.fatal || this.ws) return;
     this.setState('connecting');
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -249,13 +254,20 @@ export class TerminalSession {
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
+    // 下面每个回调都要确认「我还是当前这条连接」。
+    // 否则旧连接的 onclose 迟到触发时会把**新**连接的引用置空：
+    // sendFrame 直接 return，键盘输入被静默丢弃，终端看起来就卡死了。
+    const isCurrent = (): boolean => this.ws === ws;
+
     ws.onopen = () => {
+      if (!isCurrent()) return;
       this.retry = 0;
       this.setState('online');
       if (this.lastCols) this.sendResize(this.lastCols, this.lastRows);
     };
 
     ws.onmessage = (ev: MessageEvent) => {
+      if (!isCurrent()) return;
       const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : null;
       if (!buf || buf.length === 0) return;
       const kind = buf[0];
@@ -290,11 +302,12 @@ export class TerminalSession {
         this.exited = true;
         this.opts.onExit?.({ code, signal });
       } else if (kind === S_ERROR) {
-        this.writeSystemLine(`服务端错误: ${new TextDecoder().decode(payload)}\n`);
+        this.handleServerError(payload);
       }
     };
 
     ws.onerror = () => {
+      if (!isCurrent()) return;
       try {
         ws.close();
       } catch {
@@ -303,11 +316,36 @@ export class TerminalSession {
     };
 
     ws.onclose = () => {
+      // 只有当前连接才有资格改动状态：旧连接迟到的 onclose 一律忽略
+      if (!isCurrent()) return;
       this.ws = null;
-      if (this.disposed || this.suppressRetry) return;
+      if (this.disposed || this.fatal) return;
       this.setState('offline');
       if (!this.exited) this.scheduleRetry();
     };
+  }
+
+  /**
+   * 处理服务端的错误帧。
+   *
+   * 服务端拒绝（比如会话数已达上限）时，浏览器拿不到 HTTP 状态码，
+   * 只能靠这一帧知道原因。收到后**停止重连**：否则会无限指数重试，
+   * 终端永远处于 offline，用户也看不到任何原因。
+   */
+  private handleServerError(payload: Uint8Array): void {
+    let code = 'error';
+    let message = new TextDecoder().decode(payload);
+    try {
+      const info = JSON.parse(message) as { code?: string; error?: string };
+      code = info.code ?? 'error';
+      message = info.error ?? message;
+    } catch {
+      /* 不是 JSON 就原样显示 */
+    }
+    this.fatal = true;
+    this.setState('offline');
+    this.writeSystemLine(`\x1b[31m${message}\x1b[0m\n`);
+    this.opts.onError?.(message, code);
   }
 
   /** 关闭会话（服务端会杀掉 PTY 进程）。 */
@@ -361,22 +399,39 @@ export class TerminalSession {
     this.fitAddon = null;
     this.outQueue = [];
     this.outQueueBytes = 0;
+    if (this.flushTimer !== null) {
+      if (this.flushUsesTimeout) {
+        window.clearTimeout(this.flushTimer);
+      } else {
+        cancelAnimationFrame(this.flushTimer);
+      }
+      this.flushTimer = null;
+      this.flushPending = false;
+    }
   }
 
   /** 重启会话：丢弃旧 PTY，向服务端申请一个新的。 */
   restart(): void {
-    this.suppressRetry = true;
-    if (this.ws) {
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    // 先把引用摘掉再关：旧连接迟到的 onclose 会发现「自己已经不是当前连接」，
+    // 于是直接忽略，不会把新连接的状态搅乱。
+    const old = this.ws;
+    this.ws = null;
+    if (old) {
       try {
-        this.ws.close();
+        old.close();
       } catch {
         /* ignore */
       }
-      this.ws = null;
     }
-    this.suppressRetry = false;
+    // 用户主动重启 = 重新给一次机会（之前可能是被服务端拒绝的）
+    this.fatal = false;
     this.sid = null;
     this.exited = false;
+    this.retry = 0;
     this.release();
     this.connect();
   }
@@ -424,7 +479,7 @@ export class TerminalSession {
   }
 
   private scheduleRetry(): void {
-    if (this.disposed || this.retryTimer !== null) return;
+    if (this.disposed || this.fatal || this.retryTimer !== null) return;
     const delay = Math.min(8000, 500 * Math.pow(2, this.retry));
     this.retry += 1;
     this.retryTimer = window.setTimeout(() => {
@@ -448,14 +503,32 @@ export class TerminalSession {
   private flush(): void {
     if (this.flushPending) return;
     this.flushPending = true;
-    requestAnimationFrame(() => {
+    const run = () => {
       this.flushPending = false;
+      this.flushTimer = null;
+      this.flushUsesTimeout = false;
       if (!this.term || this.outQueue.length === 0) return;
       const batch = this.outQueue;
       this.outQueue = [];
       this.outQueueBytes = 0;
       for (const chunk of batch) this.term.write(chunk);
-    });
+    };
+    // 标签页隐藏时 requestAnimationFrame 不会触发，输出会一直堆在队列里，
+    // 堆到 MAX_PENDING_BYTES 后只能丢掉最旧的部分——TUI 的画面就花掉了。
+    // 所以隐藏时改用 setTimeout 兜底，保证输出照常被消费。
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.flushUsesTimeout = true;
+      this.flushTimer = window.setTimeout(run, 16);
+    } else {
+      this.flushUsesTimeout = false;
+      this.flushTimer = requestAnimationFrame(run);
+    }
+  }
+
+  /** 标签页重新可见：把积压的输出尽快刷出去，并同步一次尺寸。 */
+  onVisible(): void {
+    this.flush();
+    this.refreshSize();
   }
 
   private sendInput(data: string): void {
@@ -482,6 +555,16 @@ export class TerminalSession {
     const frame = new Uint8Array(payload.length + 1);
     frame[0] = kind;
     frame.set(payload, 1);
-    ws.send(frame);
+    try {
+      ws.send(frame);
+    } catch {
+      // 发送失败说明这条连接已经废了：关掉它，让 onclose 触发重连。
+      // 不这么做的话输入会被静默丢弃，用户只会觉得「终端卡住了」。
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }

@@ -35,8 +35,10 @@ pub struct Config {
     pub dev_host: Option<String>,
     pub dev_port: Option<u16>,
 
-    /// 日志文件（追加写）
+    /// 日志文件（追加写 + 自动轮转）
     pub log_file: Option<PathBuf>,
+    /// 日志文件轮转阈值（字节），0 = 用默认值
+    pub log_max_bytes: u64,
 
     /// 是否要求管理员身份（网关注入 X-Trim-Isadmin）
     pub require_admin: bool,
@@ -50,7 +52,7 @@ impl Default for Config {
             gateway_prefix: "/app/nas-webterm".to_string(),
             app_name: "nas-webterm".to_string(),
             display_name: "Web 终端".to_string(),
-            version: "1.0.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             shell: "/bin/bash".to_string(),
             cwd: "/root".to_string(),
             startup_command: String::new(),
@@ -62,6 +64,7 @@ impl Default for Config {
             dev_host: None,
             dev_port: None,
             log_file: None,
+            log_max_bytes: 0,
             require_admin: true,
         }
     }
@@ -121,6 +124,11 @@ impl Config {
                     )
                 }
                 "--log-file" => cfg.log_file = Some(PathBuf::from(value()?)),
+                "--log-max-bytes" => {
+                    cfg.log_max_bytes = value()?
+                        .parse()
+                        .map_err(|_| "--log-max-bytes 需要非负整数".to_string())?
+                }
                 "--require-admin" => {
                     cfg.require_admin = parse_bool(&value()?)
                         .ok_or_else(|| "--require-admin 需要 true/false".to_string())?
@@ -163,11 +171,12 @@ pub fn usage() -> &'static str {
      --shell <path>             默认 shell\n\
      --cwd <path>               默认工作目录\n\
      --startup-command <cmd>    新会话自动键入的命令\n\
-     --idle-minutes <n>         会话空闲保留分钟数（0 = 立即回收）\n\
+     --idle-minutes <n>         会话空闲保留分钟数（0 = 永不回收）\n\
      --max-sessions <n>         最大并发会话数\n\
      --socket-mode <oct>        socket 权限（八进制，默认 600）\n\
      --socket-gid <gid>         socket 属组\n\
      --host <h> --port <p>      开发模式：监听 TCP\n\
-     --log-file <path>          日志文件\n\
+     --log-file <path>          日志文件（追加写，超限自动轮转）\n\
+     --log-max-bytes <n>        日志轮转阈值（字节，默认 8MB）\n\
      --require-admin <bool>     是否要求管理员身份（默认 true）\n"
 }
