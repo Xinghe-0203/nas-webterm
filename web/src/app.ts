@@ -9,6 +9,8 @@ interface Tab {
   dotEl: HTMLElement;
   title: string;
   cmd: string | null;
+  /** 服务端 PTY 的进程号（状态栏显示用） */
+  pid: number | null;
 }
 
 interface PersistedTab {
@@ -18,6 +20,8 @@ interface PersistedTab {
 }
 
 const STORAGE_KEY = 'nas-webterm.tabs.v1';
+const THEME_KEY = 'nas-webterm.theme';
+const FONT_KEY = 'nas-webterm.fontSize';
 const MAX_RESTORE = 8;
 const FONT_MIN = 9;
 const FONT_MAX = 28;
@@ -39,20 +43,31 @@ export class App {
   private seq = 0;
   private persistTimer: number | null = null;
   private maxSessions = 0;
+  private shell = '';
+  private cwd = '';
 
   private tabstrip = document.getElementById('tabstrip') as HTMLElement;
   private panes = document.getElementById('panes') as HTMLElement;
   private connEl = document.getElementById('conn') as HTMLElement;
   private menuEl = document.getElementById('menu') as HTMLElement;
+  private statEls = {
+    shell: document.getElementById('stat-shell'),
+    cwd: document.getElementById('stat-cwd'),
+    size: document.getElementById('stat-size'),
+    font: document.getElementById('stat-font'),
+    session: document.getElementById('stat-session'),
+  };
 
   constructor(opts: AppOptions) {
     this.base = opts.base;
-    this.fontSize = opts.fontSize ?? 14;
-    this.initialFontSize = this.fontSize;
+    this.fontSize = this.readSavedFontSize(opts.fontSize ?? 14);
+    this.initialFontSize = opts.fontSize ?? 14;
     this.startupCommand = opts.startupCommand ?? '';
   }
 
   start(): void {
+    // 先把主题应用到 <html>，避免终端/标签栏出现一帧旧配色
+    this.applyTheme(this.readSavedTheme(), false);
     this.bindGlobalEvents();
     // 暴露给自动化验证脚本（页面本身仅管理员可见）
     (window as unknown as { __webterm__?: App }).__webterm__ = this;
@@ -71,7 +86,9 @@ export class App {
     const live = await this.loadServerSessions();
 
     const restored = this.restore();
-    let used = live.size;
+    // 只有「还挂着客户端」的会话才真正占着名额：没有客户端的残留会被服务端回收。
+    let busy = 0;
+    for (const clients of live.values()) if (clients > 0) busy += 1;
     let skipped = 0;
 
     for (const t of restored) {
@@ -81,12 +98,12 @@ export class App {
         continue;
       }
       // 会话已经没了：要重新开一个，但先看还有没有名额
-      if (this.maxSessions && used >= this.maxSessions) {
+      if (this.maxSessions && busy >= this.maxSessions) {
         skipped += 1;
         continue;
       }
       this.createTab(t.cmd, null, t.title);
-      used += 1;
+      busy += 1;
     }
 
     if (this.tabs.length === 0) {
@@ -112,38 +129,51 @@ export class App {
     try {
       const res = await fetch(`${this.base}api/config`, { credentials: 'same-origin' });
       const json = await res.json();
-      if (json?.ok) this.maxSessions = Number(json.data?.maxSessions ?? 0);
+      if (json?.ok) {
+        this.maxSessions = Number(json.data?.maxSessions ?? 0);
+        this.shell = String(json.data?.shell ?? '');
+        this.cwd = String(json.data?.cwd ?? '');
+        this.updateStatusBar();
+      }
     } catch {
       /* 拿不到就不做上限预检 */
     }
   }
 
-  /** 读取服务端现存的会话 id 集合。 */
-  private async loadServerSessions(): Promise<Set<string>> {
+  /** 读取服务端现存的会话：会话 id → 当前客户端数。 */
+  private async loadServerSessions(): Promise<Map<string, number>> {
     try {
       const res = await fetch(`${this.base}api/sessions`, { credentials: 'same-origin' });
       const json = await res.json();
       const list = Array.isArray(json?.data) ? json.data : [];
-      return new Set(
-        list
-          .map((s: { id?: string; alive?: boolean }) =>
-            s?.alive === false ? '' : (s?.id ?? ''),
-          )
-          .filter((id: string) => id.length > 0),
-      );
+      const map = new Map<string, number>();
+      for (const s of list as Array<{ id?: string; alive?: boolean; clients?: number }>) {
+        if (s?.alive === false) continue;
+        if (!s?.id) continue;
+        map.set(s.id, Number(s.clients ?? 0));
+      }
+      return map;
     } catch {
-      return new Set();
+      return new Map();
     }
   }
 
-  /** 新建标签页前检查会话数是否已达上限，避免服务端拒绝后前端一直重连。 */
+  /**
+   * 新建标签页前检查会话数是否已达上限，避免服务端拒绝后前端一直重连。
+   *
+   * 注意别只数总数：服务端现在会优先回收「没有任何客户端连接」的残留会话
+   * （页面刷新、浏览器被关、重启标签页没删旧会话都会留下这种），
+   * 只有所有会话都还挂着客户端时，新会话才会真的被拒绝。
+   */
   private async atSessionLimit(): Promise<boolean> {
     if (!this.maxSessions) return false;
     try {
       const res = await fetch(`${this.base}api/sessions`, { credentials: 'same-origin' });
       const json = await res.json();
-      const count = Array.isArray(json?.data) ? json.data.length : 0;
-      return count >= this.maxSessions;
+      const list: Array<{ clients?: number }> = Array.isArray(json?.data) ? json.data : [];
+      if (list.length < this.maxSessions) return false;
+      const busy = list.filter((s) => Number(s?.clients ?? 0) > 0).length;
+      return busy >= this.maxSessions;
     } catch {
       return false;
     }
@@ -155,6 +185,11 @@ export class App {
     el.className = 'tab';
     const defaultLabel = cmd ?? `终端 ${id}`;
     el.title = defaultLabel;
+
+    const iconEl = document.createElement('span');
+    iconEl.className = 'tab-icon';
+    iconEl.textContent = '>_';
+    iconEl.setAttribute('aria-hidden', 'true');
 
     const titleEl = document.createElement('span');
     titleEl.className = 'title';
@@ -173,7 +208,7 @@ export class App {
       this.closeTab(this.tabs.findIndex((t) => t.id === id));
     });
 
-    el.append(titleEl, dotEl, closeBtn);
+    el.append(iconEl, titleEl, dotEl, closeBtn);
     el.addEventListener('mousedown', (e) => {
       // 中键关闭，浏览器标签页的经典操作
       if (e.button === 1) {
@@ -182,6 +217,11 @@ export class App {
       }
     });
     el.addEventListener('click', () => this.activate(this.tabs.findIndex((t) => t.id === id)));
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.showTabMenu(e, this.tabs.findIndex((t) => t.id === id));
+    });
     dotEl.addEventListener('click', (e) => {
       e.stopPropagation();
       this.restartTab(this.tabs.findIndex((t) => t.id === id));
@@ -201,7 +241,9 @@ export class App {
           // shell 会通过 OSC 设置标题；拿不到时退回到「终端 N」
           this.setTitle(id, cmd ?? defaultLabel);
         }
-        void info;
+        const cur = this.tabs.find((t) => t.id === id);
+        if (cur) cur.pid = info.pid ?? null;
+        this.updateStatusBar();
         this.persist();
       },
       onTitle: (t) => this.setTitle(id, t),
@@ -213,6 +255,9 @@ export class App {
         }
       },
       onState: (state) => this.onStateChange(id, state),
+      onSize: () => {
+        if (this.tabs[this.activeIndex]?.id === id) this.updateStatusBar();
+      },
       onError: (message, code) => {
         // 服务端明确拒绝（例如会话数已达上限）：把原因显示出来，
         // 并点亮状态点提示这个标签页当前不可用。
@@ -230,7 +275,17 @@ export class App {
       },
     });
 
-    const tab: Tab = { id, session, el, panel, titleEl, dotEl, title: titleEl.textContent ?? '终端', cmd };
+    const tab: Tab = {
+      id,
+      session,
+      el,
+      panel,
+      titleEl,
+      dotEl,
+      title: titleEl.textContent ?? '终端',
+      cmd,
+      pid: null,
+    };
     this.tabs.push(tab);
     this.tabstrip.appendChild(el);
     session.connect();
@@ -253,6 +308,7 @@ export class App {
       active.session.focus();
       this.updateHash(active);
       this.updateConnIndicator(active.session.connState);
+      this.updateStatusBar();
     }
   }
 
@@ -305,9 +361,7 @@ export class App {
   }
 
   private updateConnIndicator(state: ConnState): void {
-    this.connEl.classList.remove('online', 'connecting');
-    const led = document.createElement('span');
-    led.className = 'led';
+    this.connEl.classList.remove('online', 'connecting', 'offline');
     let text = '未连接';
     if (state === 'online') {
       this.connEl.classList.add('online');
@@ -315,8 +369,83 @@ export class App {
     } else if (state === 'connecting') {
       this.connEl.classList.add('connecting');
       text = '连接中';
+    } else {
+      this.connEl.classList.add('offline');
     }
-    this.connEl.replaceChildren(led, document.createTextNode(text));
+    const label = this.connEl.querySelector('.conn-text');
+    if (label) label.textContent = text;
+  }
+
+  /** 刷新底部状态栏：shell / cwd / 会话 id / 尺寸 / 字号。 */
+  private updateStatusBar(): void {
+    if (this.statEls.shell) this.statEls.shell.textContent = this.shell || '—';
+    if (this.statEls.cwd) this.statEls.cwd.textContent = this.cwd || '—';
+    if (this.statEls.font) this.statEls.font.textContent = `${this.fontSize}px`;
+
+    const tab = this.tabs[this.activeIndex];
+    const size = tab?.session.size;
+    if (this.statEls.size) {
+      this.statEls.size.textContent =
+        size && size.cols > 0 && size.rows > 0 ? `${size.cols}×${size.rows}` : '—';
+    }
+    if (this.statEls.session) {
+      const sid = tab?.session.sid ?? '';
+      if (!tab) {
+        this.statEls.session.textContent = '';
+      } else if (!sid) {
+        this.statEls.session.textContent = '未建立会话';
+      } else {
+        // 会话 id 很长（128 位随机），状态栏只显示前 12 个字符
+        const short = sid.length > 14 ? `${sid.slice(0, 14)}…` : sid;
+        const pid = tab.pid ? ` · pid ${tab.pid}` : '';
+        this.statEls.session.textContent = `${short}${pid}`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ 主题
+
+  private readSavedTheme(): 'dark' | 'light' {
+    try {
+      const v = localStorage.getItem(THEME_KEY);
+      if (v === 'light' || v === 'dark') return v;
+    } catch {
+      /* 隐私模式下 localStorage 不可用 */
+    }
+    return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+  }
+
+  private readSavedFontSize(fallback: number): number {
+    try {
+      const v = Number(localStorage.getItem(FONT_KEY));
+      if (Number.isFinite(v) && v >= FONT_MIN && v <= FONT_MAX) return v;
+    } catch {
+      /* 忽略 */
+    }
+    return fallback;
+  }
+
+  private applyTheme(theme: 'dark' | 'light', save = true): void {
+    document.documentElement.dataset.theme = theme;
+    for (const t of this.tabs) t.session.setTheme(theme);
+    if (save) {
+      try {
+        localStorage.setItem(THEME_KEY, theme);
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+
+  private openHelp(): void {
+    this.hideMenu();
+    const dlg = document.getElementById('help-dialog') as HTMLDialogElement | null;
+    if (!dlg) return;
+    if (typeof dlg.showModal === 'function') {
+      if (!dlg.open) dlg.showModal();
+    } else {
+      dlg.setAttribute('open', '');
+    }
   }
 
   // ------------------------------------------------------------------ 快捷键
@@ -331,6 +460,35 @@ export class App {
     menuBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       this.showMenu(menuBtn);
+    });
+
+    // 深浅色切换：覆盖飞牛桌面下发的主题，并记住用户的选择
+    const themeBtn = document.getElementById('theme-toggle');
+    themeBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+      this.applyTheme(current === 'light' ? 'dark' : 'light');
+    });
+
+    // 帮助弹窗：顶栏 ? 按钮、状态栏「快捷键」、以及新建菜单里的入口
+    const helpBtn = document.getElementById('help');
+    helpBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.openHelp();
+    });
+    const statusHelp = document.getElementById('status-help');
+    statusHelp?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.openHelp();
+    });
+    const helpDialog = document.getElementById('help-dialog') as HTMLDialogElement | null;
+    document.getElementById('help-close')?.addEventListener('click', () => {
+      if (helpDialog && typeof helpDialog.close === 'function') helpDialog.close();
+      else helpDialog?.removeAttribute('open');
+    });
+    // 点遮罩关闭（dialog 自身区域之外的点击目标是 dialog 元素本身）
+    helpDialog?.addEventListener('click', (e) => {
+      if (e.target === helpDialog && typeof helpDialog.close === 'function') helpDialog.close();
     });
 
     document.addEventListener('click', () => this.hideMenu());
@@ -400,8 +558,8 @@ export class App {
       if (data.type === 'theme' || data.type === 'themeChange') {
         const theme = data.theme ?? data.value;
         if (theme === 'light' || theme === 'dark') {
-          document.documentElement.dataset.theme = theme;
-          for (const t of this.tabs) t.session.setTheme(theme);
+          // 桌面主题变化只影响本次显示，不覆盖用户手动选择的偏好
+          this.applyTheme(theme, false);
         }
       }
     });
@@ -420,45 +578,87 @@ export class App {
   private setFontSize(size: number): void {
     this.fontSize = Math.max(FONT_MIN, Math.min(FONT_MAX, size));
     for (const t of this.tabs) t.session.setFontSize(this.fontSize);
+    this.updateStatusBar();
+    try {
+      localStorage.setItem(FONT_KEY, String(this.fontSize));
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  /** 菜单项：左侧文案，右侧灰色提示（快捷键等）。 */
+  private addMenuItem(
+    label: string,
+    hint: string,
+    action: () => void,
+    danger = false,
+  ): void {
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    if (danger) btn.classList.add('danger');
+    if (hint) {
+      const small = document.createElement('small');
+      small.textContent = hint;
+      btn.appendChild(small);
+    }
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.hideMenu();
+      action();
+    });
+    this.menuEl.appendChild(btn);
+  }
+
+  private addMenuSeparator(): void {
+    this.menuEl.appendChild(document.createElement('hr'));
+  }
+
+  /** 把菜单摆到视口内的合适位置（右下角会自动往回收，避免出界）。 */
+  private placeMenu(x: number, y: number): void {
+    this.menuEl.style.maxWidth = `${Math.max(160, window.innerWidth - 16)}px`;
+    this.menuEl.hidden = false;
+    const rect = this.menuEl.getBoundingClientRect();
+    const left = Math.min(x, window.innerWidth - rect.width - 8);
+    const top = Math.min(y, window.innerHeight - rect.height - 8);
+    this.menuEl.style.left = `${Math.max(8, left)}px`;
+    this.menuEl.style.top = `${Math.max(8, top)}px`;
   }
 
   private showMenu(anchor: HTMLElement): void {
     this.menuEl.replaceChildren();
-    const items: Array<[string, string, () => void]> = [
-      [
-        '默认命令',
-        this.startupCommand || '普通 Shell',
-        () => {
-          void this.newTab(this.defaultCommand());
-        },
-      ],
-      [
-        '空白 Shell',
-        '',
-        () => {
-          void this.newTab(null);
-        },
-      ],
-    ];
-    for (const [label, hint, action] of items) {
-      const btn = document.createElement('button');
-      btn.textContent = label;
-      if (hint) {
-        const small = document.createElement('small');
-        small.textContent = hint;
-        btn.appendChild(small);
-      }
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        this.hideMenu();
-        action();
-      });
-      this.menuEl.appendChild(btn);
-    }
+    this.addMenuItem('默认命令', this.startupCommand || '普通 Shell', () => {
+      void this.newTab(this.defaultCommand());
+    });
+    this.addMenuItem('空白 Shell', '', () => {
+      void this.newTab(null);
+    });
+    this.addMenuSeparator();
+    this.addMenuItem('快捷键与帮助', '?', () => this.openHelp());
     const rect = anchor.getBoundingClientRect();
-    this.menuEl.hidden = false;
-    this.menuEl.style.left = `${Math.max(4, rect.left)}px`;
-    this.menuEl.style.top = `${rect.bottom + 4}px`;
+    this.placeMenu(rect.left, rect.bottom + 6);
+  }
+
+  /** 标签页右键菜单：重启、复制会话 ID、关闭。 */
+  private showTabMenu(e: MouseEvent, index: number): void {
+    const tab = this.tabs[index];
+    if (!tab) return;
+    this.menuEl.replaceChildren();
+    this.addMenuItem('重启会话', '重新申请 PTY', () => this.restartTab(index));
+    this.addMenuItem('复制会话 ID', tab.session.sid ? '' : '尚未建立', () => {
+      const sid = tab.session.sid;
+      if (sid) void this.copyText(sid);
+    });
+    this.addMenuSeparator();
+    this.addMenuItem('关闭标签页', 'Alt+Shift+W', () => void this.closeTab(index), true);
+    this.placeMenu(e.clientX, e.clientY);
+  }
+
+  private async copyText(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      /* 浏览器不给剪贴板权限时静默忽略 */
+    }
   }
 
   private hideMenu(): void {

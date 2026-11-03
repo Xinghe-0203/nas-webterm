@@ -20,17 +20,93 @@
   </head>
   <body>
     <div id="app">
-      <div id="tabbar" class="tabbar">
-        <div id="tabstrip" class="tabstrip"></div>
-        <div class="tabbar-actions">
-          <button id="newtab" class="iconbtn" title="新建标签页（Alt+Shift+T）" aria-label="新建标签页">＋</button>
-          <button id="newtab-menu" class="iconbtn slim" title="新建方式" aria-label="新建方式">▾</button>
+      <header class="chrome">
+        <div class="brand" aria-hidden="true">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="14" height="14">
+              <path d="M4.1 4.4 7.5 8l-3.4 3.6" fill="none" stroke="currentColor" stroke-width="1.7"
+                stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M8.9 11.7h3.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+            </svg>
+          </span>
+          <span class="brand-name">Web 终端</span>
         </div>
-        <div class="tabbar-spacer"></div>
-        <div id="conn" class="conn" title="连接状态"></div>
-      </div>
-      <div id="panes" class="panes"></div>
+
+        <div class="tabs-shell">
+          <div id="tabstrip" class="tabstrip" role="tablist" aria-label="终端标签页"></div>
+          <div class="tabbar-actions">
+            <button id="newtab" class="iconbtn newtab" title="新建标签页（Alt+Shift+T）" aria-label="新建标签页">
+              <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+                <path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button id="newtab-menu" class="iconbtn caret" title="新建方式" aria-label="新建方式">
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                <path d="M4.5 6.5 8 10l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="chrome-right">
+          <button id="theme-toggle" class="iconbtn" title="切换深浅色" aria-label="切换深浅色">
+            <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.6" />
+              <path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4 17 7M7 17l-1.6 1.6"
+                fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path d="M20.5 13.2A8.6 8.6 0 0 1 10.8 3.5a8.7 8.7 0 1 0 9.7 9.7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <button id="help" class="iconbtn helpbtn" title="快捷键与帮助" aria-label="快捷键与帮助">?</button>
+          <div id="conn" class="conn" title="连接状态">
+            <span class="led"></span>
+            <span class="conn-text">未连接</span>
+          </div>
+        </div>
+      </header>
+
+      <main id="panes" class="panes"></main>
+
+      <footer class="statusbar">
+        <div class="status-left">
+          <span class="status-item" title="默认 shell"><span class="k">shell</span><span id="stat-shell" class="v">—</span></span>
+          <span class="status-item" title="工作目录"><span class="k">cwd</span><span id="stat-cwd" class="v">—</span></span>
+        </div>
+        <div id="stat-session" class="status-mid"></div>
+        <div class="status-right">
+          <span class="status-item" title="终端行列数"><span class="k">size</span><span id="stat-size" class="v">—</span></span>
+          <span class="status-item" title="字号"><span class="k">font</span><span id="stat-font" class="v">14px</span></span>
+          <button id="status-help" class="statuslink" title="快捷键与帮助">快捷键</button>
+        </div>
+      </footer>
+
       <div id="menu" class="menu" hidden></div>
+
+      <dialog id="help-dialog" class="modal" aria-label="快捷键与帮助">
+        <div class="modal-card">
+          <div class="modal-head">
+            <div>
+              <h2>快捷键与帮助</h2>
+              <p class="modal-sub">像浏览器标签页一样管理你的终端会话</p>
+            </div>
+            <button id="help-close" class="iconbtn" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="shortcut-grid">
+            <span class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>T</kbd></span><span>新建标签页</span>
+            <span class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>W</kbd></span><span>关闭当前标签页</span>
+            <span class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>1</kbd>…<kbd>9</kbd></span><span>切换到指定标签页</span>
+            <span class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>←</kbd><kbd>→</kbd></span><span>切换到上 / 下一个标签页</span>
+            <span class="keys"><kbd>Ctrl</kbd><kbd>+</kbd><kbd>-</kbd><kbd>0</kbd></span><span>放大 / 缩小 / 复位字号</span>
+            <span class="keys"><kbd>中键</kbd></span><span>关闭点击的标签页</span>
+            <span class="keys"><kbd>右键</kbd></span><span>标签页更多操作（重启 / 复制会话 ID）</span>
+          </div>
+          <div class="modal-foot">
+            会话在服务端保持，刷新页面或重新打开应用会自动接回原来的终端。
+          </div>
+        </div>
+      </dialog>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -38,6 +38,8 @@ export interface TerminalSessionOpts {
   onExit?: (info: { code: number; signal: number | null }) => void;
   onTitle?: (title: string) => void;
   onState?: (state: ConnState) => void;
+  /** 终端行列数变化（底部状态栏用） */
+  onSize?: (cols: number, rows: number) => void;
   /** 服务端明确拒绝（会话数超限等）时回调：提示用户，且不再自动重连 */
   onError?: (message: string, code: string) => void;
 }
@@ -46,35 +48,51 @@ export interface TerminalSessionOpts {
 const MAX_PENDING_BYTES = 1024 * 1024;
 
 const DARK_THEME = {
-  background: '#0c0d11',
-  foreground: '#d8dce3',
-  cursor: '#d8dce3',
-  cursorAccent: '#0c0d11',
-  selectionBackground: 'rgba(76,141,255,0.35)',
-  black: '#20242c',
-  red: '#e5534b',
-  green: '#3fb950',
-  yellow: '#d29922',
-  blue: '#4c8dff',
-  magenta: '#bc8cff',
-  cyan: '#39c5cf',
-  white: '#c9d1d9',
-  brightBlack: '#6e7681',
-  brightRed: '#ff7b72',
-  brightGreen: '#56d364',
-  brightYellow: '#e3b341',
-  brightBlue: '#79b8ff',
-  brightMagenta: '#d2a8ff',
-  brightCyan: '#56d4dd',
-  brightWhite: '#f0f6fc',
+  background: '#090c11',
+  foreground: '#e6edf7',
+  cursor: '#4da3ff',
+  cursorAccent: '#090c11',
+  selectionBackground: 'rgba(77,163,255,0.30)',
+  black: '#171d27',
+  red: '#ff6b81',
+  green: '#3ddc97',
+  yellow: '#f5c451',
+  blue: '#4da3ff',
+  magenta: '#b98cff',
+  cyan: '#3fd0d4',
+  white: '#c8d3e2',
+  brightBlack: '#5d6a7d',
+  brightRed: '#ff8a9b',
+  brightGreen: '#6cf0b6',
+  brightYellow: '#ffd97a',
+  brightBlue: '#7dbcff',
+  brightMagenta: '#d0b0ff',
+  brightCyan: '#6ee7e7',
+  brightWhite: '#f3f8ff',
 };
 
 const LIGHT_THEME = {
-  background: '#fbfbfc',
-  foreground: '#1e2128',
-  cursor: '#1e2128',
-  cursorAccent: '#fbfbfc',
-  selectionBackground: 'rgba(76,141,255,0.25)',
+  background: '#fcfdff',
+  foreground: '#1a2230',
+  cursor: '#0b74d1',
+  cursorAccent: '#fcfdff',
+  selectionBackground: 'rgba(11,116,209,0.22)',
+  black: '#1a2230',
+  red: '#d32f2f',
+  green: '#0f9d6e',
+  yellow: '#a16207',
+  blue: '#0b74d1',
+  magenta: '#7c3aed',
+  cyan: '#0e7490',
+  white: '#5f6b7c',
+  brightBlack: '#8a94a4',
+  brightRed: '#dc2626',
+  brightGreen: '#10b981',
+  brightYellow: '#ca8a04',
+  brightBlue: '#2563eb',
+  brightMagenta: '#8b5cf6',
+  brightCyan: '#0891b2',
+  brightWhite: '#94a3b8',
 };
 
 const FONT_STACK =
@@ -126,6 +144,14 @@ export class TerminalSession {
 
   get isExited(): boolean {
     return this.exited;
+  }
+
+  /** 当前终端行列数（尚未挂载时退回最近一次同步值）。 */
+  get size(): { cols: number; rows: number } {
+    return {
+      cols: this.term?.cols ?? this.lastCols,
+      rows: this.term?.rows ?? this.lastRows,
+    };
   }
 
   /** 把终端挂到容器里（第一次激活时调用）。 */
@@ -213,6 +239,7 @@ export class TerminalSession {
       this.lastCols = cols;
       this.lastRows = rows;
       this.sendResize(cols, rows);
+      this.opts.onSize?.(cols, rows);
     }
   }
 
