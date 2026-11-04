@@ -130,12 +130,15 @@ export class TerminalSession {
   private state: ConnState = 'offline';
   private lastCols = 0;
   private lastRows = 0;
+  /** 当前字号（终端未挂载时也保留，mount 时使用） */
+  private fontSizeValue: number;
   private exited = false;
 
   constructor(opts: TerminalSessionOpts) {
     this.opts = opts;
     this.sid = opts.sid ?? null;
     this.cmd = opts.cmd ?? null;
+    this.fontSizeValue = opts.fontSize ?? 14;
   }
 
   get connState(): ConnState {
@@ -169,7 +172,7 @@ export class TerminalSession {
       cursorStyle: 'block',
       cursorInactiveStyle: 'outline',
       fontFamily: FONT_STACK,
-      fontSize: this.opts.fontSize ?? 14,
+      fontSize: this.fontSizeValue,
       lineHeight: 1.2,
       letterSpacing: 0,
       scrollback: 8000,
@@ -244,6 +247,9 @@ export class TerminalSession {
   }
 
   setFontSize(size: number): void {
+    // 记住字号，即使终端还没挂载。
+    // 否则「先调字号、后打开标签页」的那个标签页会退回创建时的旧字号。
+    this.fontSizeValue = size;
     if (!this.term) return;
     this.term.options.fontSize = size;
     this.refreshSize();

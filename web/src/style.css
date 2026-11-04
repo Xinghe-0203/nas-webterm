@@ -165,33 +165,6 @@ html[data-theme="light"] .chrome::after {
   opacity: 0.35;
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  flex: 0 0 auto;
-  padding-right: 4px;
-}
-
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 27px;
-  height: 27px;
-  border-radius: 9px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #fff;
-  box-shadow: 0 4px 14px rgba(77, 163, 255, 0.32);
-}
-
-.brand-name {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-  color: var(--fg);
-  white-space: nowrap;
-}
-
 /* ---- 标签页 ---- */
 
 .tabs-shell {
@@ -894,12 +867,6 @@ kbd {
 /* ==========================================================================
    响应式
    ========================================================================== */
-
-@media (max-width: 900px) {
-  .brand-name {
-    display: none;
-  }
-}
 
 @media (max-width: 760px) {
   .status-mid,

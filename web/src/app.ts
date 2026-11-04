@@ -109,16 +109,18 @@ export class App {
     if (this.tabs.length === 0) {
       this.createTab(this.defaultCommand());
     }
+    const wanted = this.tabFromHash();
+    const idx = wanted >= 0 ? wanted : 0;
+    this.activate(Math.min(idx, this.tabs.length - 1));
+
+    // 提示要等标签页激活之后再写：
+    // 上面 activate() 之前 activeIndex 还是 -1，写过去等于写进了虚空。
     if (skipped > 0) {
       this.writeSystem(
         this.activeIndex,
         `\r\n\x1b[33m有 ${skipped} 个标签页因会话数已达上限（${this.maxSessions} 个）未能恢复。\x1b[0m\r\n`,
       );
     }
-
-    const wanted = this.tabFromHash();
-    const idx = wanted >= 0 ? wanted : 0;
-    this.activate(Math.min(idx, this.tabs.length - 1));
     window.setTimeout(() => this.tabs[this.activeIndex]?.session.focus(), 60);
   }
 
@@ -184,7 +186,9 @@ export class App {
     const el = document.createElement('div');
     el.className = 'tab';
     const defaultLabel = cmd ?? `终端 ${id}`;
-    el.title = defaultLabel;
+    // 标签页标题：恢复已有会话时用服务端保存的标题，新建时用命令或「终端 N」
+    const label = title ?? defaultLabel;
+    el.title = label;
 
     const iconEl = document.createElement('span');
     iconEl.className = 'tab-icon';
@@ -193,7 +197,7 @@ export class App {
 
     const titleEl = document.createElement('span');
     titleEl.className = 'title';
-    titleEl.textContent = title ?? defaultLabel;
+    titleEl.textContent = label;
 
     const dotEl = document.createElement('span');
     dotEl.className = 'dot';
@@ -332,11 +336,16 @@ export class App {
     const tab = this.tabs[index];
     if (!tab) return;
     tab.dotEl.classList.remove('on');
+    // 旧会话已经没了，pid 也要清掉：否则状态栏会一直显示上一个进程的 pid，
+    // 新会话就绪后（onReady）再写回真实的 pid。
+    tab.pid = null;
+    this.updateStatusBar();
     void tab.session.restart();
     this.activate(index);
   }
 
-  private setTitle(id: number, title: string): void {    const tab = this.tabs.find((t) => t.id === id);
+  private setTitle(id: number, title: string): void {
+    const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return;
     tab.title = title;
     tab.titleEl.textContent = title;
