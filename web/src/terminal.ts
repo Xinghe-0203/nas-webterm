@@ -7,10 +7,26 @@ import '@xterm/xterm/css/xterm.css';
 /** 帧类型：与服务端 Rust 实现一一对应 */
 const C_INPUT = 0x01;
 const C_RESIZE = 0x02;
+const C_TERM_RESPONSE = 0x05;
 const S_OUTPUT = 0x01;
 const S_EXIT = 0x02;
 const S_READY = 0x03;
 const S_ERROR = 0x04;
+
+/**
+ * xterm.js 对 OSC 4/10/11/12 与 DA 查询的自动应答。
+ *
+ * 这些应答是终端模拟器“替用户”生成的，不是键盘输入；必须在 onData
+ * 里单独识别出来，走 C_TERM_RESPONSE 控制帧，而不是混进普通输入。
+ * 后端会再核对发起查询的前台进程是否还在读，核对不通过就丢弃——
+ * 这样程序查询后立即退出时，rgb:... / 1;2c 不会灌进 Shell 输入框。
+ */
+const TERMINAL_RESPONSE_RE =
+  /^(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+n|[?>]?[0-9]+;[0-9]+R|[?>]?[0-9]+;[0-9]+\$y|[0-9]+(?:;[0-9]+)+t)|\x1b\](?:4;\d+;rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}|10;rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}|11;rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}|12;rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4})(?:\x07|\x1b\\))+$/;
+
+function isTerminalResponse(data: string): boolean {
+  return data.length > 2 && data.charCodeAt(0) === 0x1b && TERMINAL_RESPONSE_RE.test(data);
+}
 
 export type ConnState = 'connecting' | 'online' | 'offline';
 
@@ -42,62 +58,94 @@ export interface TerminalSessionOpts {
   onSize?: (cols: number, rows: number) => void;
   /** 服务端明确拒绝（会话数超限等）时回调：提示用户，且不再自动重连 */
   onError?: (message: string, code: string) => void;
+  /**
+   * 键盘输入拦截器。返回 true 表示这次输入已被上层消费（AI 模式），
+   * 不再写进 PTY。普通命令必须原样返回 false，否则终端就没法用了。
+   */
+  interceptInput?: (data: string) => boolean;
+  /**
+   * Shift+Enter：强制把当前行当自然语言交给 AI（xterm 默认会把它变成普通回车）。
+   * 返回 true 表示已处理。
+   */
+  onShiftEnter?: () => boolean;
+  /** 右键粘贴（Windows Terminal 的默认行为）；返回 true 表示已处理 */
+  onPasteRequest?: () => boolean;
+  /** Ctrl+Shift+C；返回 true 表示已处理（没有选中内容时返回 false） */
+  onCopyRequest?: () => boolean;
 }
 
 /** 终端未挂载时的输出缓冲上限（字节） */
 const MAX_PENDING_BYTES = 1024 * 1024;
 
+/**
+ * 终端配色：Windows Terminal 的 Campbell（深色）/ Campbell 浅色变体。
+ *
+ * 这是 PowerShell 7 / Windows Terminal 的出厂配色，蓝、青、黄、绿的饱和度
+ * 与终端里常见的 ls / systemctl 输出更协调；比之前那套纯灰阶更容易分辨
+ * 错误（红）、警告（黄）、目录（蓝）。
+ */
 const DARK_THEME = {
-  background: '#090c11',
-  foreground: '#e6edf7',
-  cursor: '#4da3ff',
-  cursorAccent: '#090c11',
-  selectionBackground: 'rgba(77,163,255,0.30)',
-  black: '#171d27',
-  red: '#ff6b81',
-  green: '#3ddc97',
-  yellow: '#f5c451',
-  blue: '#4da3ff',
-  magenta: '#b98cff',
-  cyan: '#3fd0d4',
-  white: '#c8d3e2',
-  brightBlack: '#5d6a7d',
-  brightRed: '#ff8a9b',
-  brightGreen: '#6cf0b6',
-  brightYellow: '#ffd97a',
-  brightBlue: '#7dbcff',
-  brightMagenta: '#d0b0ff',
-  brightCyan: '#6ee7e7',
-  brightWhite: '#f3f8ff',
+  background: '#0C0C0C',
+  foreground: '#CCCCCC',
+  cursor: '#FFFFFF',
+  cursorAccent: '#0C0C0C',
+  selectionBackground: 'rgba(255,255,255,0.28)',
+  black: '#0C0C0C',
+  red: '#C50F1F',
+  green: '#13A10E',
+  yellow: '#C19C00',
+  blue: '#0037DA',
+  magenta: '#881798',
+  cyan: '#3A96DD',
+  white: '#CCCCCC',
+  brightBlack: '#767676',
+  brightRed: '#E74856',
+  brightGreen: '#16C60C',
+  brightYellow: '#F9F1A5',
+  brightBlue: '#3B78FF',
+  brightMagenta: '#B4009E',
+  brightCyan: '#61D6D6',
+  brightWhite: '#F2F2F2',
 };
 
+/** 浅色：Campbell 的浅色变体（Windows Terminal 里 "Campbell Powershell" 的思路）。 */
 const LIGHT_THEME = {
-  background: '#fcfdff',
-  foreground: '#1a2230',
-  cursor: '#0b74d1',
-  cursorAccent: '#fcfdff',
-  selectionBackground: 'rgba(11,116,209,0.22)',
-  black: '#1a2230',
-  red: '#d32f2f',
-  green: '#0f9d6e',
-  yellow: '#a16207',
-  blue: '#0b74d1',
-  magenta: '#7c3aed',
-  cyan: '#0e7490',
-  white: '#5f6b7c',
-  brightBlack: '#8a94a4',
-  brightRed: '#dc2626',
-  brightGreen: '#10b981',
-  brightYellow: '#ca8a04',
-  brightBlue: '#2563eb',
-  brightMagenta: '#8b5cf6',
-  brightCyan: '#0891b2',
-  brightWhite: '#94a3b8',
+  background: '#F9F9F9',
+  foreground: '#1A1A1A',
+  cursor: '#000000',
+  cursorAccent: '#F9F9F9',
+  selectionBackground: 'rgba(0,0,0,0.22)',
+  black: '#1A1A1A',
+  red: '#B01818',
+  green: '#107C10',
+  yellow: '#8A6A00',
+  blue: '#0037DA',
+  magenta: '#7A1474',
+  cyan: '#1E6FAF',
+  white: '#767676',
+  brightBlack: '#767676',
+  brightRed: '#C50F1F',
+  brightGreen: '#13A10E',
+  brightYellow: '#9C7500',
+  brightBlue: '#2554C7',
+  brightMagenta: '#881798',
+  brightCyan: '#0E7B8B',
+  brightWhite: '#4A4A4A',
 };
 
+/**
+ * 终端字体栈。
+ *
+ * 第一项是内置的 Nerd Font 子集：普通等宽字体没有 Nerd Font 的私有区码点，
+ * 终端里跑 oh-my-posh / starship 这类带图标的提示符时，那些字符会被浏览器
+ * 画成彩色方块（tofu）。内置一份子集后这些图标能正常显示。
+ *
+ * Nerd Font 只覆盖图标区，ASCII 与中文仍由后面的等宽字体渲染。
+ */
 const FONT_STACK =
-  '"Sarasa Mono SC","Noto Sans Mono CJK SC","Source Han Mono SC","WenQuanYi Micro Hei",' +
-  'Menlo,Monaco,"DejaVu Sans Mono","Microsoft YaHei Mono",Consolas,monospace';
+  '"NasWebTermNerd","Sarasa Mono SC","Noto Sans Mono CJK SC","Source Han Mono SC",' +
+  '"WenQuanYi Micro Hei",Menlo,Monaco,"DejaVu Sans Mono","Microsoft YaHei Mono",' +
+  'Consolas,monospace';
 
 /**
  * 一个标签页 = 一个服务端 PTY 会话。
@@ -206,7 +254,82 @@ export class TerminalSession {
       /* 浏览器不支持 WebGL 时回落到 DOM/Canvas 渲染 */
     }
 
-    term.onData((data) => this.sendInput(data));
+    // Shift+Enter 在 xterm 里等同于普通回车，没法直接分辨。
+    // 这里在 keydown 阶段先截住它：交给上层决定要不要当成「对 AI 说话」。
+    // Ctrl+Shift+C / V 同理：Windows Terminal 的复制粘贴快捷键，
+    // 但没有选中内容时要让浏览器自己处理（否则用户复制不了页面上的字）。
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
+      if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        const handled = this.opts.onShiftEnter?.() ?? false;
+        if (handled) {
+          e.preventDefault();
+          return false;
+        }
+      }
+      // Ctrl+Shift+C：复制选中内容。终端焦点在这里，所以由这一层统一处理，
+      // 文档级的全局快捷键不要再管 C/V，否则一次按键会被处理两遍（粘贴两次）。
+      if (e.ctrlKey && e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+        if (this.opts.onCopyRequest?.()) {
+          e.preventDefault();
+          return false;
+        }
+      }
+      // Ctrl+Shift+V：Windows Terminal 风格的粘贴，走剪贴板 API。
+      //
+      // API 不可用（HTTP 访问）时**不要**吃掉这个按键：放它过去，
+      // 浏览器的原生粘贴就会照常发生（和单独 Ctrl+V 一样能粘）。
+      if (e.ctrlKey && e.shiftKey && !e.altKey && (e.key === 'v' || e.key === 'V')) {
+        if (this.opts.onPasteRequest?.()) {
+          e.preventDefault();
+          return false;
+        }
+        // 没粘成 → 交给浏览器做原生粘贴（不 preventDefault）
+        return false;
+      }
+      // 单独的 Ctrl+V：交给浏览器做**原生粘贴**。
+      //
+      // xterm 默认把 Ctrl+V 当成「引号插入」（真实终端就是这样，屏幕上会显示 ^V），
+      // 并且会 preventDefault 掉按键的默认动作——连带把浏览器的原生粘贴也挡掉了。
+      // 这里返回 false 让 xterm 提前退出、不再 preventDefault，
+      // 浏览器的 paste 事件就会照常触发，xterm 自己会把它转成 PTY 输入
+      // （bracketed paste 也照常处理）。
+      // 好处：这条路径不依赖剪贴板 API，HTTP 访问下也能粘。
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
+        return false;
+      }
+      return true;
+    });
+
+    // 右键 = 粘贴（有选中内容时先复制）
+    //
+    // 剪贴板 API 不可用时（HTTP 访问）**不能**吃掉右键菜单：
+    // 浏览器的原生菜单里有「粘贴」，那是 HTTP 下唯一能粘贴的办法。
+    term.element?.addEventListener('contextmenu', (e) => {
+      const selection = this.getSelection().trim();
+      const canUseApi = !!navigator.clipboard?.writeText;
+      if (!canUseApi) {
+        // 让浏览器弹出原生菜单（复制 / 粘贴）
+        return;
+      }
+      e.preventDefault();
+      if (selection) {
+        void navigator.clipboard.writeText(selection).catch(() => undefined);
+        this.clearSelection();
+        return;
+      }
+      this.opts.onPasteRequest?.();
+    });
+
+    term.onData((data) => {
+      // xterm.js 的查询应答（DA / OSC 颜色）走控制帧，不能当键盘输入。
+      if (isTerminalResponse(data)) {
+        this.sendTerminalResponse(data);
+        return;
+      }
+      if (this.opts.interceptInput?.(data)) return;
+      this.sendInput(data);
+    });
     term.onBinary((data) => this.sendBinary(data));
     term.onTitleChange((title) => {
       if (title) {
@@ -394,8 +517,14 @@ export class TerminalSession {
     this.opts.onError?.(message, code);
   }
 
-  /** 关闭会话（服务端会杀掉 PTY 进程）。 */
-  async close(): Promise<void> {
+  /**
+   * 关闭会话。
+   *
+   * deleteSession = true 时同时 DELETE 服务端会话：服务端会杀掉 PTY 里的
+   * shell 及其子进程，内存/进程立即释放。只有会话已经明确不在服务端
+   * （例如服务重启后同步清理）才传 false，避免一次无意义的 404 请求。
+   */
+  async close(deleteSession = true): Promise<void> {
     this.disposed = true;
     if (this.retryTimer !== null) {
       window.clearTimeout(this.retryTimer);
@@ -411,7 +540,7 @@ export class TerminalSession {
     }
     const sid = this.sid;
     this.sid = null;
-    if (sid) {
+    if (sid && deleteSession) {
       await this.deleteSession(sid);
     }
     // 完整释放：观察器、终端实例、未写出的输出缓冲
@@ -445,10 +574,15 @@ export class TerminalSession {
 
   dispose(): void {
     this.disposed = true;
-    if (this.retryTimer !== null) window.clearTimeout(this.retryTimer);
-    if (this.ws) {
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
       try {
-        this.ws.close();
+        ws.close();
       } catch {
         /* ignore */
       }
@@ -465,6 +599,7 @@ export class TerminalSession {
     this.fitAddon = null;
     this.outQueue = [];
     this.outQueueBytes = 0;
+    this.pendingAltEnter = false;
     if (this.flushTimer !== null) {
       if (this.flushUsesTimeout) {
         window.clearTimeout(this.flushTimer);
@@ -515,6 +650,36 @@ export class TerminalSession {
     this.pushOutput(new TextEncoder().encode(text));
   }
 
+  /** 直接往 PTY 写一段输入（AI 用来清行 / 回填命令）。 */
+  writeInput(data: string): void {
+    if (data) this.sendInput(data);
+  }
+
+  /** 当前选中的文字（右键复制 / Ctrl+Shift+C 用）。 */
+  getSelection(): string {
+    return this.term?.getSelection() ?? '';
+  }
+
+  /** 选中全部（供自动化测试与「全选复制」用）。 */
+  selectAll(): void {
+    this.term?.selectAll();
+  }
+
+  clearSelection(): void {
+    this.term?.clearSelection();
+  }
+
+  /**
+   * 粘贴一段文本。
+   *
+   * 走 xterm 的 paste 而不是直接写 PTY：xterm 会按 bracketed paste 模式
+   * 包裹内容，多行粘贴不会被 shell 逐行当成回车执行。
+   */
+  paste(text: string): void {
+    if (!this.term || !text) return;
+    this.term.paste(text);
+  }
+
   /**
    * 进入备用屏幕（全屏 TUI 用的那块屏幕）。
    *
@@ -530,6 +695,16 @@ export class TerminalSession {
     }
     this.pendingAltEnter = false;
     this.term.write('\x1b[?1049h');
+  }
+
+  /**
+   * xterm 的隐藏输入框。
+   *
+   * 浏览器的原生粘贴（Ctrl+V）是把内容 paste 到这个 textarea 上、xterm 再转发给 PTY，
+   * 这条路**不需要任何权限**，HTTP 下照样能用。execCommand('paste') 也依赖它。
+   */
+  get textarea(): HTMLTextAreaElement | null {
+    return (this.term?.element?.querySelector('textarea') as HTMLTextAreaElement | null) ?? null;
   }
 
   /** 当前可见区域的纯文本内容（供自动化验证使用）。 */
@@ -611,6 +786,13 @@ export class TerminalSession {
     this.sendFrame(C_INPUT, bytes);
   }
 
+  /** 发送终端自动应答（DA/OSC 查询），由后端校验接收者后决定是否写 PTY。 */
+  private sendTerminalResponse(data: string): void {
+    if (!data) return;
+    const bytes = new TextEncoder().encode(data);
+    this.sendFrame(C_TERM_RESPONSE, bytes);
+  }
+
   /** 8 位鼠标等原始字节流（xterm 的 onBinary 给的是 latin1 字符串）。 */
   private sendBinary(data: string): void {
     if (!data) return;
@@ -624,6 +806,7 @@ export class TerminalSession {
   }
 
   private sendFrame(kind: number, payload: Uint8Array): void {
+    if (this.disposed) return;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const frame = new Uint8Array(payload.length + 1);

@@ -15,7 +15,11 @@ if [ -z "${FPK}" ]; then
 fi
 [ -n "${FPK}" ] && [ -f "${FPK}" ] || { echo "找不到 .fpk，请先运行 ./build.sh" >&2; exit 1; }
 
-APP_NAME="nas-webterm"
+# 从 .fpk 的 manifest 里取 appname：普通版是 nas-webterm，AI 版是 nas-webterm-ai。
+# 写死的话 AI 包的网关前缀就对不上，测出来全是 404（不是产品问题）。
+APP_NAME="$(tar -xOf "${FPK}" manifest 2>/dev/null |
+    sed -n 's/^appname[[:space:]]*=[[:space:]]*//p' | head -n1 | tr -d '[:space:]')"
+APP_NAME="${APP_NAME:-nas-webterm}"
 PREFIX="/app/${APP_NAME}"
 SIM="$(mktemp -d)"
 trap 'cleanup' EXIT
@@ -32,9 +36,16 @@ check() {
 }
 
 cleanup() {
-    if [ -f "${SIM}/var/webterm.pid" ]; then
-        kill "$(cat "${SIM}/var/webterm.pid" 2>/dev/null)" 2>/dev/null || true
+    # 1.2.2 起 start 会拉起 supervisor：只杀 webterm.pid 会被它重新拉起来。
+    if [ -x "${SIM}/pkg/cmd/main" ]; then
+        "${SIM}/pkg/cmd/main" stop >/dev/null 2>&1 || true
     fi
+    local f
+    for f in "${SIM}/var/webterm.sup.pid" "${SIM}/var/webterm.pid"; do
+        if [ -f "${f}" ]; then
+            kill -KILL "$(cat "${f}" 2>/dev/null)" 2>/dev/null || true
+        fi
+    done
     pkill -f "${SIM}/target/server/nas-webterm" 2>/dev/null || true
     rm -rf "${SIM}"
 }

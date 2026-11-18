@@ -42,6 +42,12 @@ pub struct Config {
 
     /// 是否要求管理员身份（网关注入 X-Trim-Isadmin）
     pub require_admin: bool,
+
+    /// 普通版：不加载、不注册任何 AI 相关能力（分版构建时由 cmd/main 传入）
+    pub no_ai: bool,
+
+    /// AI 助手配置文件路径（JSON）。为空时只在内存里保存，重启即丢。
+    pub ai_config: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -66,11 +72,29 @@ impl Default for Config {
             log_file: None,
             log_max_bytes: 0,
             require_admin: true,
+            no_ai: false,
+            ai_config: None,
         }
     }
 }
 
 impl Config {
+    /// 本次「安装实例」的唯一标识，写进每个终端进程的环境变量。
+    ///
+    /// 用途有两个：
+    ///   * 服务崩溃后重启时，据此清理上一次运行残留的孤儿 shell；
+    ///   * 避免误杀**另一个实例**（例如同一台机器上同时装了普通版和 AI 版，
+    ///     或者开发时 `tools/dev.sh` 起的调试服务和线上服务并存）。
+    ///
+    /// 取值 = 应用名 + socket 路径（开发模式用监听地址），同一个安装每次启动都一致。
+    pub fn instance_tag(&self) -> String {
+        if let Some(port) = self.dev_port {
+            let host = self.dev_host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+            return format!("{}|dev:{}:{}", self.app_name, host, port);
+        }
+        format!("{}|{}", self.app_name, self.socket.display())
+    }
+
     /// 解析命令行参数。未知参数一律报错，避免拼写错误被静默忽略。
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut cfg = Config::default();
@@ -129,10 +153,12 @@ impl Config {
                         .parse()
                         .map_err(|_| "--log-max-bytes 需要非负整数".to_string())?
                 }
+                "--no-ai" => cfg.no_ai = true,
                 "--require-admin" => {
                     cfg.require_admin = parse_bool(&value()?)
                         .ok_or_else(|| "--require-admin 需要 true/false".to_string())?
                 }
+                "--ai-config" => cfg.ai_config = Some(PathBuf::from(value()?)),
                 "--help" | "-h" => {
                     return Err(usage().to_string());
                 }
@@ -178,5 +204,6 @@ pub fn usage() -> &'static str {
      --host <h> --port <p>      开发模式：监听 TCP\n\
      --log-file <path>          日志文件（追加写，超限自动轮转）\n\
      --log-max-bytes <n>        日志轮转阈值（字节，默认 8MB）\n\
-     --require-admin <bool>     是否要求管理员身份（默认 true）\n"
+     --require-admin <bool>     是否要求管理员身份（默认 true）\n\
+     --ai-config <path>         AI 助手配置文件（JSON，含 API Key）\n"
 }

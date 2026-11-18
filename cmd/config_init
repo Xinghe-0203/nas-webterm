@@ -2,8 +2,8 @@
 # 设置变更前：校验配置项，非法直接退出（应用中心会展示错误信息）。
 set -u
 
-for pair in "wizard_idle_minutes:${wizard_idle_minutes:-60}:0:10080" \
-            "wizard_max_sessions:${wizard_max_sessions:-16}:1:64"; do
+for pair in "wizard_idle_minutes:${wizard_idle_minutes:-0}:0:10080" \
+            "wizard_max_sessions:${wizard_max_sessions:-32}:1:64"; do
     name="${pair%%:*}"
     rest="${pair#*:}"
     value="${rest%%:*}"

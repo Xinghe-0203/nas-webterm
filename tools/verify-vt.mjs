@@ -139,6 +139,15 @@ class Cdp {
     await cdp.send('Runtime.enable');
     await sleep(args.wait);
 
+    // 等会话真正就绪再输入：WS 还没连上时键入的字符会被直接丢掉（不 echo、
+    // 也不进 PTY），测试就会误报「终端没有输出」。这不是产品缺陷，是竞态。
+    let sessionReady = false;
+    for (let i = 0; i < 80 && !sessionReady; i += 1) {
+      sessionReady = Boolean(await cdp.eval('window.__webterm__ && window.__webterm__.activeSid'));
+      if (!sessionReady) await sleep(200);
+    }
+    if (!sessionReady) throw new Error('终端会话未就绪（activeSid 为空）');
+
     await cdp.eval('window.__webterm__ && window.__webterm__.focusActive()');
     await sleep(300);
 

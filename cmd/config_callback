@@ -18,10 +18,9 @@ mkdir -p "${PKG_VAR}" 2>/dev/null
 
 printf '[%s] [config] settings updated\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE}" 2>/dev/null
 
-# 重启使配置生效；start 是幂等的，应用中心后续再启动一次也不会重复拉起
+# 重启使配置生效（restart 会先停守护进程再拉起，避免旧会话残留在旧配置下）
 if [ -x "${SCRIPT_DIR}/main" ]; then
-    "${SCRIPT_DIR}/main" stop >> "${LOG_FILE}" 2>&1 || true
-    "${SCRIPT_DIR}/main" start >> "${LOG_FILE}" 2>&1 || true
+    "${SCRIPT_DIR}/main" restart >> "${LOG_FILE}" 2>&1 || true
 fi
 
 exit 0

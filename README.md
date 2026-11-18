@@ -1,312 +1,256 @@
-# Web 终端（nas-webterm）
+# Web 终端（nas-webterm / nas-webterm-ai）
 
-飞牛 fnOS 的浏览器式多标签 Web 终端。后端 **Rust**（tokio + axum + portable-pty），前端 **TypeScript + xterm.js**。
-每个标签页是一个真实的后台 PTY 进程，默认以 **root** 身份运行，全屏 TUI 程序（vim、htop、top…）可直接使用。
+飞牛 fnOS 里的浏览器式多标签终端：打开浏览器就能用 root shell，关掉页面任务还在跑。
 
-- 应用名：`nas-webterm`
-- 显示名：Web 终端
-- 版本：1.0.4
-- 源码：https://github.com/Xinghe-0203/nas-webterm
-- 产物：`dist/nas-webterm-1.0.4.fpk`（含 x86_64 + aarch64 双架构）
+![界面](docs/screenshots/ui-dark.png)
 
-### 1.0.4 更新内容（界面重做）
+<p align="center"><img src="docs/screenshots/ai-panel.png" width="420" alt="AI 助手"></p>
 
-| 区域 | 变化 |
-| --- | --- |
-| 顶栏 | 「品牌标识 + 胶囊标签栏 + 连接状态灯」三段式布局；标签页从浏览器式页签改为圆角胶囊，活动标签有冷色渐变高光 |
-| 状态栏 | 新增底部状态栏：shell、工作目录、活动会话 id 与 pid、终端尺寸、当前字号，右侧一键打开快捷键帮助 |
-| 主题 | 深浅两套配色一键切换（顶栏右侧开关），选择记在 localStorage；跟随飞牛桌面主题时不会覆盖用户手选 |
-| 帮助 | 新增快捷键帮助弹窗（含全部 7 组快捷键），点击遮罩或 Esc 关闭 |
-| 标签菜单 | 标签页右键菜单：重启会话 / 复制会话 ID / 关闭标签页（危险操作标红并提示快捷键） |
-| 细节 | 字号记忆（Ctrl + / - / 0 调整后保留）、连接状态三态（已连接 / 连接中 / 未连接）带呼吸动效、窄屏自动收起次要信息、`prefers-reduced-motion` 下关闭动画 |
-| 会话名额 | 前端预检改为只统计「还挂着客户端」的会话：服务端可回收的无主残留不再让用户被假上限挡住 |
+> 这个项目有两个版本，**同一个仓库**：
+>
+> - **普通版** `nas-webterm`：只有终端，源码里没有任何 AI 代码。
+> - **AI 版** `nas-webterm-ai`：终端 + 右下角 AI 助手（对话、执行命令、聊天记录）。
+>
+> 两个版本的 appname 不同，可以同时装在一台 NAS 上。
 
-### 1.0.3 更新内容
-
-| 类别 | 修复 |
-| --- | --- |
-| 会话名额 | 前端「重启标签页」不再把旧会话留在服务端（点 32 次就再也建不了会话）；服务端名额满时自动回收「没有客户端连接」的孤儿会话，且**只回收最老的那个** |
-| 会话结束 | 终端里跑过后台进程时退出 shell，现在一定能收到退出事件并结束会话（以前会永远挂着、PTY 变成僵尸） |
-| 断线重连 | 大回放按 64KiB 分片下发（以前整块塞进一个帧，前端一次丢掉，重连后终端一片空白） |
-| 输入阻塞 | 前台程序不读输入时不会拖死整个服务，客户端会收到明确的错误提示帧 |
-| 会话清理 | 子进程退出后立即释放 WebSocket 连接，不再白占名额 |
-| 安全 | 会话 ID 改为 128 位随机（不再 32 位可枚举）；窗口尺寸做上下界校验（超大数值不再被截断成奇怪值）；静态资源路径会做百分号解码；索引文件缺失时不再把服务器绝对路径回显到响应里 |
-| 运维 | `/api/healthz` 的 `uptime` 修成真实运行时长（原来返回的是 Unix 时间戳）；停止服务时先杀会话再退出，最多 2 秒退干净；停止时校验进程身份，避免 PID 复用误杀别的进程 |
+更短的使用说明见 [docs/使用教程.md](docs/使用教程.md)。
 
 ---
 
-## 1. 功能
+## 1. 怎么用（3 分钟上手）
 
-| 能力 | 说明 |
-| --- | --- |
-| 浏览器式多标签 | 新建 / 关闭 / 中键关闭 / 快捷键切换，每个标签是独立的 shell 会话 |
-| root 权限 | 默认以 root 启动交互式 shell，可直接执行 `docker`、`systemctl` 等特权操作 |
-| 真彩色 TUI | `TERM=xterm-256color`、`COLORTERM=truecolor`、备用屏幕、鼠标跟踪、括号粘贴全部原生支持 |
-| WebGL 渲染 | xterm.js WebGL 渲染器，全屏重绘不掉帧；不支持时自动回落到 Canvas/DOM |
-| 断线重连 | 关页面/断网后会话继续跑（默认永不超时回收），刷新/重连回放最近输出并接回原会话 |
-| 全屏程序还原 | 全屏 TUI 程序（vim / htop / top…）在关掉页面、过很久再打开时，界面会正确重建而不是乱码或空白 |
-| 资源回收 | 会话结束时子进程被 wait 回收，不留僵尸进程；前端关闭标签页会释放终端实例、观察器与输出缓冲 |
-| 自适应尺寸 | 浏览器窗口变化实时调整 PTY 行列数，TUI 会跟着重排 |
-| 中日韩字符 | Unicode 11 宽度计算，中文/emoji 对齐正确 |
-| 自动执行命令（可选） | 默认关闭。想常开某个程序时，可在设置里填一条命令，新标签页会自动执行它 |
-| 长期挂着 | 默认**永不按时间杀会话**，终端可以连开好几天；只有关掉标签页或程序自己退出才结束 |
+### 安装
 
-### 快捷键
+1. 从 [Releases](https://github.com/Xinghe-0203/nas-webterm/releases) 下载最新的 `.fpk`；
+   也可以自己构建（见第 6 节，产物在 `dist/`）。两个版本任选一个：
+
+   - 普通版：`nas-webterm-1.2.5.fpk`
+   - AI 版：`nas-webterm-ai-1.2.5.fpk`
+
+2. 打开飞牛：**应用中心 → 我的应用 → 手动安装**，选对应的 `.fpk`。
+3. 安装向导直接点下一步（默认值即可）。
+4. 回到桌面，点 **Web 终端** / **Web 终端 AI** 图标。
+
+> 桌面图标只对**管理员**显示。这个应用提供 root shell，这是刻意设计。
+
+### 第一次打开
+
+- 页面就是一个终端，直接敲命令，和你用 SSH 一样。
+- 左上角 `+` 新建标签页；每个标签页是一个独立 shell。
+- 关掉浏览器/刷新页面：后台终端不会死，重新打开会自动接回来。
+- 关闭标签页：这个终端里的进程会被一起结束。
+
+### AI 版怎么用
+
+1. 点右上角 **⚙**（或按 `Ctrl+Alt+A`）。
+2. 填三样东西：
+   - 接口地址：例如 `https://api.deepseek.com/v1`
+   - API Key
+   - 模型名：例如 `deepseek-chat`
+3. 保存，然后直接在右下角聊天框里说：
+   - 「看看磁盘满了吗」
+   - 「把 /tmp 里三天前的日志删掉」
+   - 「装一下 htop」
+4. AI 会先说明，再给出命令：
+   - 查询类命令自动执行；
+   - 删除、覆盖文件、关机这类危险命令会弹卡片，点 **执行** 才跑。
+5. 命令卡片点标题可以展开，看到完整命令和这次的实际输出。
+6. 面板顶部的 **时钟按钮** 是聊天记录：刷新页面、换浏览器都还在，可以点开以前的对话继续聊。
+
+> AI 的 API Key 只存在 NAS 服务端（`${TRIM_PKGVAR}/ai.json`，权限 `0600`），不会发到浏览器。
+
+### 常用快捷键
 
 | 按键 | 作用 |
 | --- | --- |
-| `Alt+Shift+T` | 新建标签页 |
-| `Alt+Shift+W` | 关闭当前标签页 |
-| `Alt+Shift+←/→` 或 `↑/↓` | 上一个 / 下一个标签页 |
-| `Alt+Shift+1..9` | 跳到第 N 个标签页 |
-| `Ctrl/Cmd +` `=/-` / `0` | 放大 / 缩小 / 复位字号 |
-
-终端内的常规快捷键（`Ctrl+C`、`Ctrl+D`、`Ctrl+R`、`Ctrl+L` 等）原样传给 shell，不会被页面拦截。
-
----
-
-## 2. 安装
-
-1. 打开飞牛 → **应用中心 → 我的应用 → 手动安装**，选择 `dist/nas-webterm-1.0.4.fpk`。
-2. 安装向导里确认 shell、工作目录等参数（默认值即可）。**「启动后自动执行的命令」默认留空**，
-   新标签页就是普通 shell；想常驻某个程序就在这一项填上它。
-3. 安装完成后回到桌面，点击「Web 终端」图标。
-
-> 桌面入口只对**管理员**显示（`allUsers=false`），这是刻意设计：应用提供 root shell。
+| `Ctrl+Shift+T` | 新建标签页 |
+| `Ctrl+Shift+W` | 关闭当前标签页 |
+| `Ctrl+Tab` | 下一个标签页 |
+| `Ctrl+Alt+K` | 显示 / 收起 AI 面板 |
+| `Ctrl+Alt+A` | 打开 AI 设置 |
+| `Shift+Enter` | 把输入强制当自然语言发给 AI |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | 复制 / 粘贴 |
+| `Ctrl +` / `-` / `0` | 放大 / 缩小 / 重置字号 |
 
 ---
 
-## 3. 安全模型
+## 2. 功能
 
-理解这一点再用，很重要。
+| 能力 | 说明 |
+| --- | --- |
+| 多标签 | 每个标签独立 shell，关闭即结束整棵进程树 |
+| root shell | 默认以 root 启动，`docker`、`systemctl` 等直接可用 |
+| 断线不丢 | 关页面/断网后终端继续跑，重连回放最近输出并接回原会话 |
+| 全屏 TUI | vim / htop / top 等全屏程序关掉页面再打开也能正确重建 |
+| 真彩色 | 256 色 / truecolor、鼠标、括号粘贴、中日韩宽度 |
+| 内置 Nerd Font | oh-my-posh / starship 图标正常显示，不会变方块 |
+| 深/浅主题 | 一键切换并记住 |
+| 进程守护 | 服务异常退出后自动重启；关标签页回收整棵进程树 |
+| AI 助手（AI 版） | 自然语言 → 命令 → 审批 → 执行 → 回灌输出 → 总结 |
+| 聊天记录（AI 版） | 每轮对话落盘；刷新/换设备还在；可打开历史继续聊 |
+| 长期记忆（AI 版） | 模型用 `<remember>` 记住重要信息，跨会话保留 |
 
-- **后端以 root 运行**，因为它要提供 root shell。没有这个前提就无法真正替代终端。
-- **不监听任何 TCP 端口**：服务只监听 `${TRIM_APPDEST}/app.sock`，由飞牛统一网关（root 运行的 `trim_http_cgi`）转发。
-- **socket 权限 0600 + root:root**：即使同机其它应用读到路径也连不上。
-- **双重管理员校验**：桌面入口只对管理员显示；服务端再校验网关注入的 `X-Trim-Isadmin` 头，非管理员一律 403。
-  开启「严格校验管理员身份」时，**必须**拿到 `X-Trim-Isadmin: true` 才放行（拿不到就直接拒绝，不会因为「有用户名」就放行）。
-- **网关层认证**：`/app/*` 走飞牛登录态，未登录直接 401/跳登录页，应用本身不接触密码。
-- **数据不出本机**：终端输入输出只走内存，不落盘、不上传；日志里不记录终端内容。
-- 页面有 CSP（`default-src 'self'`、`frame-ancestors 'self'`），只允许同源资源。
+### 两个版本的区别
+
+| | 普通版 | AI 版 |
+| --- | --- | --- |
+| appname | `nas-webterm` | `nas-webterm-ai` |
+| 终端 | ✅ | ✅ |
+| 右下角 AI 面板 | ❌ | ✅ |
+| AI 代码 | 编译期完全不进二进制/包 | ✅ |
+| 适合 | 只要终端、不想带大模型配置 | 想让 AI 帮忙看机器/执行命令 |
+
+> 「普通版不含 AI」不是运行起来隐藏，而是构建时就把 `rust/src/ai/` 和 `web/src/ai/`
+> 从源码与产物里删掉；`build.sh` 会检查二进制和前端里没有任何 AI 字符串。
 
 ---
 
-## 4. 配置项
+## 3. 设置
 
-安装后在 **应用中心 → Web 终端 → 设置** 里修改，改动会持久化到 `${TRIM_PKGVAR}/settings.env` 并自动重启服务。
+安装后在 **应用中心 → Web 终端 → 设置** 里改，修改会保存并自动重启服务。
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| 默认 Shell | `/bin/bash` | 新标签页启动的 shell，可填 `/usr/bin/zsh`、`/usr/bin/fish` |
-| 默认工作目录 | `/root` | 目录不存在或不可进入时自动回退 |
-| 启动后自动执行的命令 | 空 | 默认只开普通 shell。填了才会自动键入并回车；清空保存后立即失效 |
-| 会话空闲回收（分钟） | `0` | `0` = **永不按时间回收**，关掉页面/断网后终端继续在后台跑，可以一直连开几天。只有程序自己退出才被清理 |
-| 最大同时会话数 | `32` | 1–64。达到上限后**拒绝新建**并提示你关标签页，不会杀掉你正在用的会话 |
-| 严格校验管理员身份 | 开 | 关掉后仅依赖网关登录态（网关行为异常时的兜底） |
+| 默认 Shell | `/bin/bash` | 新标签页启动的 shell，也可填 zsh / fish |
+| 默认工作目录 | `/root` | 不存在时自动回退 |
+| 启动后自动执行的命令 | 空 | 想常驻某个程序时填；留空就是普通 shell |
+| 会话空闲回收（分钟） | `0` | `0` = 永不按时间回收，关页面后终端继续跑 |
+| 最大同时会话数 | `32` | 达到上限拒绝新建，不会杀掉正在用的会话 |
+| 严格校验管理员身份 | 开 | 只在网关行为异常时关闭 |
+
+AI 版的模型设置（接口地址 / Key / 模型名 / 上下文窗口）在页面里的 **⚙** 中改。
 
 ---
 
-## 5. 文件位置
+## 4. 数据放在哪
 
-安装后（`/var/apps/nas-webterm/` 是符号链接集合，实际落在应用中心选择的卷）：
+安装后 `/var/apps/nas-webterm{,-ai}/` 是符号链接集合，真实路径由应用中心选择。
 
 | 路径 | 内容 |
 | --- | --- |
-| `${TRIM_APPDEST}/server/nas-webterm-<arch>` | 服务二进制（按 CPU 架构自动选择） |
-| `${TRIM_APPDEST}/ui/` | 前端静态资源 |
-| `${TRIM_APPDEST}/app.sock` | 网关 socket |
-| `${TRIM_PKGVAR}/info.log` | 运行日志（启动、会话创建/销毁、连接与断开、错误） |
-| `${TRIM_PKGVAR}/info.log.1` `info.log.2` | 历史日志备份（超过 8 MiB 自动轮转，保留 2 份） |
-| `${TRIM_PKGVAR}/settings.env` | 配置持久化 |
-| `${TRIM_PKGVAR}/webterm.pid` | 进程号 |
+| `${TRIM_PKGVAR}/info.log` | 运行日志（超 8 MiB 自动轮转，保留 2 份） |
+| `${TRIM_PKGVAR}/settings.env` | 安装设置 |
+| `${TRIM_PKGVAR}/ai.json` | AI 配置（含 Key，`0600`，只存服务端） |
+| `${TRIM_PKGVAR}/ai-memory.md` | 长期记忆 |
+| `${TRIM_PKGVAR}/ai-history.json` | 聊天记录（最多 50 个会话 / 每个 200 轮） |
+| `${TRIM_PKGVAR}/webterm.pid` | 服务进程号 |
+| `${TRIM_PKGVAR}/webterm.sup.pid` | 守护进程号 |
 
-日志格式统一为 `[2026-11-01 18:30:00.123] [INFO] 会话已创建：s1-3f2a (pid=1234, shell=/bin/bash, 120x32)`，
-时间戳是**本地时间**。服务启动时会把进程 umask 设为 `0077`，日志文件权限为 `0600`。
-
-常用排查命令：
+看状态 / 重启：
 
 ```bash
-sudo tail -f /var/apps/nas-webterm/var/info.log
-sudo /var/apps/nas-webterm/cmd/main status   # 0=运行中 3=已停止
-sudo /var/apps/nas-webterm/cmd/main stop
-sudo /var/apps/nas-webterm/cmd/main start
+sudo /var/apps/nas-webterm-ai/cmd/main status    # 0=运行中 3=已停止
+sudo /var/apps/nas-webterm-ai/cmd/main restart
+sudo tail -f /var/apps/nas-webterm-ai/var/info.log
 ```
 
----
-
-## 6. 故障排查
-
-| 现象 | 原因 / 处理 |
-| --- | --- |
-| 桌面没有图标 | 只有管理员能看到；换管理员账号登录 |
-| 页面空白或提示 403 | 非管理员（403 响应体会带上原因）；若提示「网关未注入 X-Trim-Isadmin 头」，说明网关行为与严格校验冲突，可在设置里临时关闭「严格校验管理员身份」 |
-| 提示「会话数已达上限」 | 标签页太多（默认上限 32）。关掉不用的标签页即可；也可以在设置里调大「最大同时会话数」 |
-| 页面能开但终端不出现 | 看 `info.log`；多为 shell 路径不存在（改回 `/bin/bash`） |
-| 提示「会话已结束」，点红点 | PTY 进程退出，点标签上的红点可重启该标签的会话 |
-| 打开 TUI 后一片空白、但普通命令正常 | 这是前端终端库解析某些能力查询序列时的缺陷（1.0.1 已修）。升级到 1.0.2 或更新版本；回归用 `node tools/verify-vt.mjs --url ...` 自测 |
-| 升级后新标签页仍自动执行某条命令 | 旧版本（1.0.0）默认带了一条命令。1.0.1 的升级向导里勾选「清空新标签页自动执行的命令」即可；也可在应用设置里手动清空后保存 |
-| 想让终端一直挂着不被回收 | 默认就是永不回收（「会话空闲回收 = 0」）。只有你自己关标签页、或程序自己退出时才会结束 |
-| 长时间不动后终端断开 | 网关 `proxy_read_timeout` 是 300 秒，服务端每 20 秒发一次心跳保活；若仍断开，检查中间是否有别的反向代理 |
-| 中文显示成方块 | NAS 上缺少中文字体；容器/最小系统可装 `fonts-wqy-zenhei`（只影响浏览器渲染，服务端不涉及） |
-
----
-
-## 7. 开发
+健康检查：
 
 ```bash
-# 后端（Rust 1.75+）
-cd rust && cargo build --release
-
-# 前端（Node 18+）
-cd web && npm install
-npx tsc --noEmit            # 类型检查
-npx vite build && node scripts/postbuild.mjs
-
-# 本地预览（TCP 端口，不走网关）
-./tools/dev.sh              # http://127.0.0.1:18086/app/nas-webterm/
+curl -s --unix-socket /var/apps/nas-webterm-ai/app.sock \
+  http://localhost/app/nas-webterm-ai/api/healthz
 ```
-
-### 目录结构
-
-```
-nas-webterm/
-├── manifest                 # 应用清单
-├── config/{privilege,resource}
-├── wizard/{install,upgrade,uninstall,config}
-├── cmd/                     # 生命周期脚本（start/stop/status + 安装升级卸载回调）
-├── app/
-│   ├── server/              # 构建产物：nas-webterm-{x86_64,aarch64}
-│   └── ui/                  # 构建产物：前端 + 桌面入口配置 config
-├── rust/                    # Rust 后端源码
-│   └── src/{main,config,proto,session,web,log}.rs
-├── web/                     # TypeScript 前端源码
-│   └── src/{main,app,terminal}.ts + style.css
-└── tools/                   # 开发、测试、打包校验脚本
-```
-
-### 后端模块
-
-| 文件 | 职责 |
-| --- | --- |
-| `main.rs` | 参数解析、运行时初始化、unix socket 监听、优雅退出 |
-| `config.rs` | 全部启动参数（由 `cmd/main` 依据 `TRIM_*` 注入） |
-| `session.rs` | PTY 会话：spawn、读写线程、回放缓冲、尺寸调整、空闲回收、进程组清理 |
-| `proto.rs` | WebSocket 二进制帧协议 |
-| `web.rs` | 路由、静态资源、REST、WebSocket 数据通道、管理员校验、安全响应头 |
-| `log.rs` | 极简日志（本地时间戳、文件追加写、超限自动轮转） |
-
-### 重连时全屏程序为什么不会乱
-
-全屏 TUI 会切到**备用屏幕**并持续重绘。重连时如果把原始字节流直接灌进终端，
-会出现两个问题：回放缓冲被上限截断在一条转义序列中间，以及客户端没先进备用屏幕、
-TUI 的重绘被画到主屏上。处理方式：
-
-1. 服务端跟踪会话当前是否处于备用屏幕（扫描输出里的 `ESC[?1049h` / `ESC[?1049l`），
-   扫描时会把上一块输出**尾部最多 7 个字节**带过来一起匹配，
-   这样即使 `ESC[?1049h` 被 PTY 的读块边界劈成两半也不会漏判；
-2. 回放内容按**转义序列边界**裁剪，而不是按换行——TUI 的重绘输出里根本没有换行，
-   按换行裁会把整段回放丢掉，重连后就是一片空白；
-3. 回放里若已不带「进入备用屏幕」那个起点，客户端会先补一条 `ESC[?1049h` 再回放；
-4. 回放完成后给前台进程组发一个 `SIGWINCH`，会响应它的 TUI 会自己把界面重画一遍。
-
-回归测试：`tools/verify-reconnect-tui.mjs`（协议层）与
-`tools/verify-reconnect-browser.mjs`（浏览器级「关掉页面再打开」）。
-
-### 帧协议
-
-二进制帧，第一字节是类型，后面是负载。终端数据不加转义、不 base64，避免 TUI 高频重绘的额外开销。
-
-| 方向 | 类型 | 负载 |
-| --- | --- | --- |
-| C→S | `0x01` INPUT | 原始键盘字节 |
-| C→S | `0x02` RESIZE | JSON `{"cols":N,"rows":M}` |
-| C→S | `0x03` SIGNAL | JSON `{"signal":"INT"}` |
-| S→C | `0x01` OUTPUT | 原始终端输出 |
-| S→C | `0x02` EXIT | JSON `{"code":N,"signal":N|null}` |
-| S→C | `0x03` READY | JSON `{"sid","shell","cwd","pid","cols","rows","altScreen","needAltEnter"}` |
-| S→C | `0x04` ERROR | JSON `{"code":"session_limit","error":"..."}`（服务端拒绝时下发，客户端据此停止重连） |
 
 ---
 
-## 8. 构建与测试
+## 5. 常见问题
 
-> 仓库里不放预编译产物：`app/server/` 的二进制和 `app/ui/` 的前端资源都由构建脚本生成。
+| 现象 | 处理 |
+| --- | --- |
+| 桌面没有图标 | 只有管理员可见，换管理员账号登录 |
+| 打开显示 404 / not found | 应用没有在网关注册。到 **应用中心 → 我的应用 → Web 终端 → 停止 → 启动**，然后重新打开；不要用脚本直接 stop/start |
+| 页面 403 | 非管理员；或「严格校验管理员身份」与网关不一致，临时关掉该开关 |
+| 终端不出现 | 看 `info.log`，多为 shell 路径写错，改回 `/bin/bash` |
+| 提示会话数已达上限 | 关掉不用的标签页，或调大「最大同时会话数」 |
+| AI 输入没反应 | 先点 ⚙ 填接口地址 / Key / 模型名 |
+| AI 一直不回 | 看 `info.log` 里 AI 相关行；检查 NAS 能否访问模型接口 |
+| AI 命令执行了但终端没变化 | 命令写进当前标签页的 PTY，切到该标签页看，或展开命令卡片看输出 |
+| 中文显示方块 | NAS 缺中文字体；浏览器侧问题，装 `fonts-wqy-zenhei` 可解决 |
+
+---
+
+## 6. 开发与构建
+
+> 仓库不提交 `dist/`、二进制和前端产物，全部由构建脚本生成。
 
 ```bash
 git clone https://github.com/Xinghe-0203/nas-webterm.git
 cd nas-webterm
-./build.sh --with-browser     # 产物在 dist/nas-webterm-<version>.fpk
+./build.sh --no-test        # 两个版本 + 双架构，产物在 dist/
+./build.sh --variant ai     # 只构建 AI 版
+./build.sh --with-browser   # 额外跑 headless 浏览器验证（需要 chromium）
 ```
 
-构建依赖：
+依赖：
 
-| 依赖 | 用途 | 缺失时 |
-| --- | --- | --- |
-| Rust 1.75+ | 后端 | 必须 |
-| `gcc-aarch64-linux-gnu` | 交叉编译 arm 架构 | 只能用 `--arch x86_64` |
-| Node.js 18+ | 前端构建 | 必须 |
-| chromium | 浏览器自动化验证 | 跳过浏览器相关测试 |
-| fnpack | 打包成 .fpk | `build.sh` 会自动下载 |
-
-```bash
-./build.sh                  # 双架构编译 + 前端构建 + 冒烟测试 + fnpack 打包 + 产物校验
-./build.sh --with-browser    # 额外跑 headless 浏览器交互验证（需要 chromium）
-./build.sh --arch x86_64     # 只出一个架构
-```
-
-交叉编译 aarch64 需要：`sudo apt install gcc-aarch64-linux-gnu`（脚本已配置 linker）。
-
-### 测试套件
-
-| 脚本 | 覆盖 |
+| 依赖 | 用途 |
 | --- | --- |
-| `cargo test`（`rust/`） | 后端纯函数单测：回放尾部裁剪（半条转义序列 / 半截 UTF-8 / 孤立字节 / 全续字节不 panic）、转义序列边界裁剪点、CSI/OSC 序列完整性 |
-| `tools/smoke-test.sh` | 19 项：start/stop/status 幂等、socket 权限、首页与资源、REST、403、WS 101、路径穿越 |
-| `tools/verify-browser.mjs` | headless Chromium：页面渲染、资源无失败、相对 API、WS、真实键入（标记由 shell 计算，避免假阳性）、无 JS 异常、截图 |
-| `tools/verify-vt.mjs` | **VT 兼容性回归**：DECRQM/DA1/OSC 10-11 等终端能力查询序列不崩解析器，alt-screen 往返后仍能输出 |
-| `tools/verify-tui-app.mjs` | 全屏 TUI 程序端到端：界面真的画出来、无异常、按键能被接收（`--cmd` 指定程序，默认 htop） |
-| `tools/verify-reconnect-tui.mjs` | 全屏 TUI 断线重连：断开 → 等待 → 重连，界面必须正确重建 |
-| `tools/verify-reconnect-browser.mjs` | 浏览器级「关掉页面再打开」：标签页恢复、TUI 画面还原、无转义残渣 |
-| `tools/verify-features.mjs` | **全功能 18 项**：READY/退出码、PTY 尺寸同步（stty 实测）、括号粘贴、中文 UTF-8、真彩色穿透、Ctrl+C、会话隔离、容量上限拒绝新建、断线重连回放、未知帧容错 |
-| `tools/verify-leaks.mjs` | **后端泄漏**：反复建/销会话，监控 RSS / fd / 线程 / 僵尸进程 |
-| `tools/verify-front-leaks.mjs` | **前端泄漏**：反复建/销标签页，监控 JS 堆 / DOM 节点 / 终端实例数 |
-| `tools/verify-tabs.mjs` | 12 项：多标签独立 PTY、输出隔离、刷新恢复、回放、关闭回收 |
-| `tools/tui-check.mjs` | 全屏 TUI：alt-screen、持续重绘、尺寸调整、Ctrl+C 退出 |
-| `tools/ws-check.mjs` | WebSocket 通道：READY 帧、命令回显 |
-| `tools/verify-fpk.sh` | 官方结构校验 + Rust 载荷（双架构 ELF、无开发产物、注入点） |
-| `tools/regress.mjs` | **1.0.3 回归 11 项**：退出 shell 必收 S_EXIT（后台进程占着 PTY 也不挂死）、名额满时回收「无客户端」的孤儿会话（且不误杀有客户端的）、狂灌输入时事件循环不卡死 |
-| `tools/regress-replay.mjs` | **1.0.3 回放回归 4 项**：重连回放按 64KiB 分片、单帧不超限、总量不被前端丢弃（大回放重连后终端不再空白） |
+| Rust 1.75+ | 后端 |
+| Node.js 18+ | 前端 |
+| gcc-aarch64-linux-gnu | 交叉编译 ARM（不装就加 `--arch x86_64`） |
+| fnpack | 打 `.fpk`，脚本会自动下载 |
+| chromium | 浏览器测试（可选） |
 
-已执行的验证结果见 `docs/screenshots/`。
-
-### 前端终端库版本锁定（重要）
-
-`web/package.json` 把 `@xterm/xterm` 固定在 **5.5.0**。原因：6.0.0 的 DECRQM（`CSI ? n $ p`）
-处理代码引用了未声明变量，全屏 TUI 程序启动时往往会发送一批终端能力查询，解析器当场抛
-`ReferenceError` 并停止工作，屏幕永久空白——普通 shell 完全正常，只有 TUI 打不开，很容易误判成后端问题。
-
-升级前端终端库前，必须先跑这两个测试：
+本地跑：
 
 ```bash
-node tools/verify-vt.mjs --url http://127.0.0.1:18086/app/nas-webterm/     # 合成能力查询序列回归
-node tools/verify-tui-app.mjs --url http://127.0.0.1:18086/app/nas-webterm/ --cmd htop
+cd rust && cargo build --release
+cd web && npm install && npx tsc --noEmit
+./tools/dev.sh    # http://127.0.0.1:18086/app/nas-webterm/
 ```
 
-`verify-vt.mjs` 的断言标记由 `printf 'VT-%s' OK` 拼出，命令行回显里不含完整标记，
-所以只有真正的程序输出能让它通过。
+目录：
+
+```
+nas-webterm/
+├── manifest                 # 应用清单 / 版本 / changelog
+├── cmd/                     # 安装、升级、启动、停止脚本
+├── wizard/                  # 安装向导
+├── rust/src/                # 后端：session / web / ai / agent / history
+├── web/src/                 # 前端：终端、标签、AI 面板
+└── tools/                   # 构建、测试、本地安装脚本
+```
+
+测试：
+
+```bash
+cd rust && cargo test                        # 后端单测
+node tools/verify-ai-history.mjs --url ...   # 聊天记录 22 项
+node tools/verify-ai-history-ui.mjs --url ...# 聊天记录界面 22 项
+```
+
+更多测试脚本见 `tools/verify-*.mjs`，每个脚本开头都有用法说明。
 
 ---
 
-## 9. 已知限制
+## 7. 安全
 
-1. **root shell 是刻意的**：任何能登录飞牛管理员的账号都能拿到 root。若只想给普通用户用，请把 `config/privilege` 的 `run-as` 改成应用用户，并在 `cmd/main` 里去掉 root 相关参数——但那就不再是完整终端了。
-2. **某些程序自带后台服务**：个别程序会在本机开一个固定端口的后台服务，同一用户下开多个实例时会争用该端口。这与本应用无关，在普通终端里也会同样报错。
-3. **未做终端分屏/窗格**：一个标签页对应一个 PTY，分屏请开多个标签页。
-4. **断线回放上限 256KB**：只回放最近的输出，更早的滚动历史不保留（刷新前可用终端自身回滚缓冲，上限 8000 行）；刷新后回到终端底部。
-5. **未适配移动端手势**：手机浏览器可用，但没有做虚拟键盘栏、滑动滚动等专门优化。
+- 后端以 **root** 运行（为了 root shell）；不监听任何 TCP 端口，只走 Unix socket（`0600`）。
+- 只对管理员显示桌面入口；服务端再校验网关注入的 `X-Trim-Isadmin`。
+- 终端输入输出只走内存，不落盘、不上传；日志不记录终端内容。
+- AI 的 Key 只存服务端 `0600` 文件，接口不下发；系统提示词由应用维护，不可在界面修改。
+- 页面有 CSP（`default-src 'self'`），只允许同源资源。
 
 ---
 
-## 10. 许可证
+## 8. 版本
+
+当前 **1.2.5**，主要更新：
+
+- 1.2.5：AI 聊天记录持久化、聊天记录面板、刷新自动恢复
+- 1.2.4：AI 命令执行可靠性（等命令真正结束、不重复循环）
+- 1.2.3：按模型上下文自动分配预算、审批策略简化
+- 1.2.2：进程守护、关标签页回收整棵进程树
+- 1.2.1：标签栏同步全部会话、终端查询应答不污染输入框
+- 1.2.0：拆分普通版 / AI 版
+
+完整历史见 `manifest` 的 `changelog` 字段。
+
+---
+
+## 9. 许可证
 
 MIT，见 `LICENSE`。
+
+- 源码：https://github.com/Xinghe-0203/nas-webterm
+- 架构：x86_64 + aarch64（同一个包通用）

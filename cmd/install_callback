@@ -11,8 +11,8 @@ log_msg() {
 }
 
 # 数值校验：非纯数字或越界直接失败，应用中心会把错误展示给用户
-for pair in "wizard_idle_minutes:${wizard_idle_minutes:-60}:0:10080" \
-            "wizard_max_sessions:${wizard_max_sessions:-16}:1:64"; do
+for pair in "wizard_idle_minutes:${wizard_idle_minutes:-0}:0:10080" \
+            "wizard_max_sessions:${wizard_max_sessions:-32}:1:64"; do
     name="${pair%%:*}"
     rest="${pair#*:}"
     value="${rest%%:*}"
@@ -40,6 +40,6 @@ done
     printf 'STRICT_ADMIN=%s\n' "${wizard_strict_admin:-true}"
 } > "${PKG_VAR}/settings.env" 2>/dev/null
 
-log_msg "installed: shell=${wizard_default_shell:-/bin/bash} cwd=${wizard_default_cwd:-/root} cmd=${wizard_startup_command-} idle=${wizard_idle_minutes:-60} max=${wizard_max_sessions:-16} strict_admin=${wizard_strict_admin:-true}"
+log_msg "installed: shell=${wizard_default_shell:-/bin/bash} cwd=${wizard_default_cwd:-/root} cmd=${wizard_startup_command-} idle=${wizard_idle_minutes:-0} max=${wizard_max_sessions:-32} strict_admin=${wizard_strict_admin:-true}"
 
 exit 0

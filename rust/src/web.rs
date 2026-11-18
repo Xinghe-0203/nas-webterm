@@ -22,18 +22,39 @@ use crate::session::{self, Session, SessionManager};
 /// 网关心跳间隔：必须小于 nginx `proxy_read_timeout 300s`，否则空闲终端会被网关掐断。
 const HEARTBEAT: Duration = Duration::from_secs(20);
 
+/// 单次 WebSocket 发送的超时。
+///
+/// 对端不读（手机锁屏、网络半断、TCP 背压）时 `send()` 会一直挂起，
+/// 那条连接就会永远占着一个 Session 引用 + 一条输出队列（最多 4MB）。
+/// 超时后直接断开，交给前端重连 + 回放。
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 单帧 / 单条消息的大小上限。
+///
+/// 终端输入都是按键或粘贴文本，2MB 已经非常宽裕；不设上限的话
+/// 一个恶意 WebSocket 帧就能让进程分配 64MB（axum 默认值）。
+const WS_MAX_MESSAGE: usize = 2 * 1024 * 1024;
+
 /// 回放分片大小：单帧不能太大，否则前端的待发队列（1MB 上限）会整帧丢弃。
 const REPLAY_CHUNK_SIZE: usize = 64 * 1024;
 
 /// 终端尺寸上限：防止畸形客户端把 PTY 设成几千列，把 TUI 渲染拖垮。
-const MAX_COLS: u16 = 1000;
-const MAX_ROWS: u16 = 1000;
+const MAX_COLS: u16 = session::MAX_COLS;
+const MAX_ROWS: u16 = session::MAX_ROWS;
 
 pub struct AppState {
     pub mgr: Arc<SessionManager>,
     pub cfg: Config,
     /// 进程启动时刻：用于 `/api/healthz` 返回真实的运行时长（秒）。
     pub started_at: std::time::Instant,
+    /// AI 助手配置（API Key 只存在后端，接口返回掩码）。
+    ///
+    /// 普通版编译时没有 `feature = "ai"`，这个字段连同相关代码都不存在。
+    #[cfg(feature = "ai")]
+    pub ai: Arc<crate::ai::AiStore>,
+    /// 进行中的 agent 任务（终端内 AI 模式）
+    #[cfg(feature = "ai")]
+    pub agents: Arc<crate::ai::agent::AgentStore>,
 }
 
 impl AppState {
@@ -57,11 +78,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             &format!("{}/api/sessions/{{id}}", prefix),
             axum::routing::delete(kill_session),
         )
-        .route(&format!("{}/api/ws", prefix), get(ws_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            admin_guard,
-        ));
+        .route(&format!("{}/api/ws", prefix), get(ws_handler));
+    // AI 路由：普通版编译时这段代码不存在，接口也不会被注册
+    #[cfg(feature = "ai")]
+    let api = crate::ai::routes::register_routes(api, state.clone(), &prefix);
+    let api = api.layer(middleware::from_fn_with_state(
+        state.clone(),
+        admin_guard,
+    ));
 
     Router::new()
         .merge(api)
@@ -70,14 +94,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// 管理员校验：网关注入 X-Trim-Isadmin，非管理员直接 403。
-///
-/// 严格模式（`require_admin = true`，安装向导默认开启）下，
-/// **必须**拿到 `X-Trim-Isadmin: true` 才放行：
-/// 拿不到标记就等于无法证明调用者是管理员，不能因为「有用户名」就放行。
-/// 否则「严格校验管理员身份」这个开关等于形同虚设——任何能访问到 socket
-/// 的人只要伪造一个用户名头就能拿到 root shell。
-async fn admin_guard(State(state): State<Arc<AppState>>, req: axum::extract::Request, next: Next) -> Response {
+pub async fn admin_guard(State(state): State<Arc<AppState>>, req: axum::extract::Request, next: Next) -> Response {
     let headers = req.headers();
     let is_admin = headers.get("x-trim-isadmin");
     let username = headers.get("x-trim-username");
@@ -161,6 +178,7 @@ async fn security_headers(State(_state): State<Arc<AppState>>, req: axum::extrac
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    let (sessions, clients, replay_bytes) = state.mgr.stats();
     axum::Json(serde_json::json!({
         "ok": true,
         "data": {
@@ -170,9 +188,26 @@ async fn healthz(State(state): State<Arc<AppState>>) -> Response {
             // 运行时长（秒）：进程启动至今。
             // 之前这里误用了 Unix 时间戳（1.7e9 量级），语义完全不对。
             "uptime": state.started_at.elapsed().as_secs(),
+            // 下面的字段用于排查「后台挂着不关会不会吃内存」：
+            // 会话数、WS 客户端数、所有会话回放缓冲的总字节数、进程 RSS。
+            "sessions": sessions,
+            "clients": clients,
+            "replayBytes": replay_bytes,
+            "rssKb": rss_kb(),
         }
     }))
     .into_response()
+}
+
+/// 当前进程的常驻内存（KB）。读 `/proc/self/statm` 的第二列（单位是页）。
+fn rss_kb() -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = if page > 0 { page as u64 } else { 4096 };
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * page / 1024)
+        .unwrap_or(0)
 }
 
 async fn app_config(State(state): State<Arc<AppState>>) -> Response {
@@ -188,6 +223,8 @@ async fn app_config(State(state): State<Arc<AppState>>) -> Response {
             "idleMinutes": state.cfg.idle_minutes,
             "maxSessions": state.cfg.max_sessions,
             "base": state.base_raw(),
+            // 普通版为 false：前端据此完全不渲染 AI 面板与相关入口
+            "aiEnabled": cfg!(feature = "ai"),
         }
     }))
     .into_response()
@@ -217,11 +254,16 @@ async fn create_session(
         cols: None,
         rows: None,
     });
-    match state.mgr.create(
-        payload.cmd,
-        payload.cols.unwrap_or(120),
-        payload.rows.unwrap_or(32),
-    ) {
+    // 创建 PTY 要 openpty + fork/exec，是同步且可能几十毫秒的操作。
+    // 放在 async handler 里会占住 tokio worker（同一时刻其它标签页的输出转发、
+    // 心跳、静态资源请求都会被拖慢），所以挪到阻塞线程池里做。
+    let mgr = state.mgr.clone();
+    let cols = payload.cols.unwrap_or(120).clamp(2, MAX_COLS);
+    let rows = payload.rows.unwrap_or(32).clamp(2, MAX_ROWS);
+    let created = tokio::task::spawn_blocking(move || mgr.create(payload.cmd, cols, rows))
+        .await
+        .unwrap_or_else(|e| Err(format!("创建会话失败: {}", e)));
+    match created {
         Ok(session) => axum::Json(serde_json::json!({
             "ok": true,
             "data": session.info(),
@@ -282,8 +324,11 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    let cols = query.cols.unwrap_or(120).max(2);
-    let rows = query.rows.unwrap_or(32).max(2);
+    let ws = ws
+        .max_message_size(WS_MAX_MESSAGE)
+        .max_frame_size(WS_MAX_MESSAGE);
+    let cols = query.cols.unwrap_or(120).clamp(2, MAX_COLS);
+    let rows = query.rows.unwrap_or(32).clamp(2, MAX_ROWS);
 
     // 有 sid 就复用已有会话（刷新页面可续上），否则新建。
     let session = match query.sid.as_deref().and_then(|id| state.mgr.get(id)) {
@@ -301,7 +346,12 @@ async fn ws_handler(
                         Some(c)
                     }
                 });
-            match state.mgr.create(startup, cols, rows) {
+            // 同上：PTY 创建是阻塞操作，别占着 async worker
+            let mgr = state.mgr.clone();
+            let created = tokio::task::spawn_blocking(move || mgr.create(startup, cols, rows))
+                .await
+                .unwrap_or_else(|e| Err(format!("创建会话失败: {}", e)));
+            match created {
                 Ok(s) => s,
                 Err(e) => {
                     // WebSocket 握手失败时浏览器拿不到 HTTP 状态码（只会看到
@@ -352,6 +402,15 @@ impl Drop for AttachGuard {
     }
 }
 
+/// 带超时的 WebSocket 发送：对端不读时不能无限期挂着。
+/// 返回 false 表示应当断开这条连接。
+async fn ws_send(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 /// 终端数据通道主循环。
 async fn terminal_loop(
     mut socket: WebSocket,
@@ -388,13 +447,11 @@ async fn terminal_loop(
         "needAltEnter": info.need_alt_enter,
     });
     let ready_bytes = serde_json::to_vec(&ready).unwrap_or_default();
-    if socket
-        .send(Message::Binary(Bytes::from(proto::frame(
-            proto::S_READY,
-            &ready_bytes,
-        ))))
-        .await
-        .is_err()
+    if !ws_send(
+        &mut socket,
+        Message::Binary(Bytes::from(proto::frame(proto::S_READY, &ready_bytes))),
+    )
+    .await
     {
         return;
     }
@@ -406,13 +463,11 @@ async fn terminal_loop(
     // 把整帧丢掉 —— 重连后终端就一片空白，而且没有任何提示。
     // 按 64KB 分片后，前端的背压逻辑只会丢最早的几片，不会整段消失。
     for chunk in info.replay.chunks(REPLAY_CHUNK_SIZE) {
-        if socket
-            .send(Message::Binary(Bytes::from(proto::frame(
-                proto::S_OUTPUT,
-                chunk,
-            ))))
-            .await
-            .is_err()
+        if !ws_send(
+            &mut socket,
+            Message::Binary(Bytes::from(proto::frame(proto::S_OUTPUT, chunk))),
+        )
+        .await
         {
             return;
         }
@@ -429,12 +484,11 @@ async fn terminal_loop(
     if !session.is_alive() {
         if let Some(info) = session.exit_info() {
             let payload = serde_json::to_vec(&info).unwrap_or_default();
-            let _ = socket
-                .send(Message::Binary(Bytes::from(proto::frame(
-                    proto::S_EXIT,
-                    &payload,
-                ))))
-                .await;
+            let _ = ws_send(
+                &mut socket,
+                Message::Binary(Bytes::from(proto::frame(proto::S_EXIT, &payload))),
+            )
+            .await;
         }
     }
 
@@ -447,7 +501,7 @@ async fn terminal_loop(
             chunk = rx.recv() => {
                 match chunk {
                     Some(frame) => {
-                        if socket.send(Message::Binary(frame)).await.is_err() {
+                        if !ws_send(&mut socket, Message::Binary(frame)).await {
                             break;
                         }
                     }
@@ -469,12 +523,14 @@ async fn terminal_loop(
                                         "error": msg,
                                     }))
                                     .unwrap_or_default();
-                                let _ = socket
-                                    .send(Message::Binary(Bytes::from(proto::frame(
+                                let _ = ws_send(
+                                    &mut socket,
+                                    Message::Binary(Bytes::from(proto::frame(
                                         proto::S_ERROR,
                                         &payload,
-                                    ))))
-                                    .await;
+                                    ))),
+                                )
+                                .await;
                                 break;
                             }
                         }
@@ -492,12 +548,14 @@ async fn terminal_loop(
                                     "error": e,
                                 }))
                                 .unwrap_or_default();
-                            let _ = socket
-                                .send(Message::Binary(Bytes::from(proto::frame(
+                            let _ = ws_send(
+                                &mut socket,
+                                Message::Binary(Bytes::from(proto::frame(
                                     proto::S_ERROR,
                                     &payload,
-                                ))))
-                                .await;
+                                ))),
+                            )
+                            .await;
                             break;
                         }
                     }
@@ -508,7 +566,7 @@ async fn terminal_loop(
             }
             // 心跳：穿过 nginx 的 300s 读超时
             _ = heartbeat.tick() => {
-                if socket.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                if !ws_send(&mut socket, Message::Ping(axum::body::Bytes::new())).await {
                     break;
                 }
             }
@@ -576,6 +634,14 @@ async fn handle_client_frame(session: &Arc<Session>, raw: &[u8]) -> FrameOutcome
             }
             FrameOutcome::Continue
         }
+        proto::C_TERM_RESPONSE => {
+            // 终端对 OSC/DA 查询的自动应答不是用户输入：必须经过
+            // “发起查询的进程是否还在读”的校验，不能直接当键盘输入写 PTY。
+            if let Err(e) = session.write_terminal_response(payload.to_vec()).await {
+                crate::log_warn!("终端查询应答处理失败: {}", e);
+            }
+            FrameOutcome::Continue
+        }
         _ => FrameOutcome::Continue,
     }
 }
@@ -608,13 +674,16 @@ async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
         path.trim_start_matches('/').to_string()
     };
     if rel.is_empty() || rel == "index.html" {
-        return serve_index(&state);
+        return serve_index(&state).await;
     }
     // URL 里的路径是百分号编码的：文件名里带编码字符的资源要解码后才找得到。
     // 解码后的路径依然交给 resolve_asset 做组件级校验（`..` 会被拒绝）。
     let rel = percent_decode(&rel);
     match resolve_asset(&state.cfg.ui_dir, &rel) {
-        Some((full, _)) => match std::fs::read(&full) {
+        // 用 tokio::fs 而不是 std::fs：这个 handler 跑在 async 运行时里，
+        // 1MB 的 JS / 500KB 的字体用同步读会把一个 worker 线程阻塞几毫秒，
+        // 同时刻其它标签页的终端输出转发、心跳都会跟着卡。
+        Some((full, _)) => match tokio::fs::read(&full).await {
             Ok(bytes) => {
                 let mime = mime_for(&full);
                 let immutable = rel.starts_with("assets/");
@@ -639,9 +708,9 @@ async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
 }
 
 /// 读取首页模板并注入网关前缀等变量。
-fn serve_index(state: &Arc<AppState>) -> Response {
+async fn serve_index(state: &Arc<AppState>) -> Response {
     let index_path = state.cfg.ui_dir.join("index.html");
-    let template = match std::fs::read_to_string(&index_path) {
+    let template = match tokio::fs::read_to_string(&index_path).await {
         Ok(t) => t,
         Err(e) => {
             // 注意：不要把服务器上的绝对路径写进响应体（信息泄露），

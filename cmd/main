@@ -1,9 +1,21 @@
 #!/bin/bash
-# Web 终端 nas-webterm —— 应用生命周期管理（start / stop / status）
+# Web 终端 nas-webterm —— 应用生命周期管理（start / stop / restart / status）
 #
-# 进程模型：单进程。
+# 进程模型：一个守护进程 + 一个服务进程。
+#   supervisor（本脚本 __supervise）常驻，负责拉起并守护 webterm；
 #   webterm（Rust）以 root 运行，同时提供静态页面、REST 接口与 WebSocket 终端通道，
 #   监听 ${TRIM_APPDEST}/app.sock 接入飞牛统一网关，不监听任何 TCP 端口。
+#
+# 为什么要守护：
+#   Rust 服务是 panic = "abort"（体积/性能考虑），任何一次未捕获的 panic、
+#   内存不足被 OOM、或者被外部误杀，进程就没了；没有守护的话整个应用会一直
+#   停留在「已停止」，只能由用户手动重开，PTY 里的 shell 也会变成孤儿。
+#   现在 supervisor 会在 1~60 秒退避后自动拉起，并把每次异常退出写进日志。
+#
+# 停止时的清理顺序（很重要）：
+#   1. 通知 supervisor，让它先给服务发 SIGTERM（服务自己会优雅退出并杀会话）；
+#   2. 服务没退干净就 SIGKILL；
+#   3. 再按 pid 文件 / 命令行 / 环境标记三层兜底，清掉残留的终端进程。
 #
 # 因为要提供 root shell，服务本身必须以 root 运行；socket 权限默认 0600，
 # 只有系统网关（以 root 运行的 trim_http_cgi）能够连接。
@@ -14,8 +26,8 @@
 set -u
 
 APP_NAME="nas-webterm"
-# 与 manifest / rust/Cargo.toml 保持一致（升级时三处一起改）
-APP_VERSION="1.0.4"
+# 与 manifest / rust/Cargo.toml 保持一致；构建脚本会按 manifest 再同步一次
+APP_VERSION="1.2.5"
 PKG_DEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
 PKG_VAR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
 PKG_HOME="${TRIM_PKGHOME:-/var/apps/${APP_NAME}/home}"
@@ -23,8 +35,12 @@ SERVER_DIR="${PKG_DEST}/server"
 UI_DIR="${PKG_DEST}/ui"
 APP_SOCKET="${PKG_DEST}/app.sock"
 PID_FILE="${PKG_VAR}/webterm.pid"
+SUP_PID_FILE="${PKG_VAR}/webterm.sup.pid"
+STOP_FLAG="${PKG_VAR}/webterm.stopping"
+LOCK_DIR="${PKG_VAR}/.start.lock"
 LOG_FILE="${PKG_VAR}/info.log"
 TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")"
 
 # 安装向导选项持久化（安装/设置变更时写入）
 if [ -r "${PKG_VAR}/settings.env" ]; then
@@ -43,6 +59,10 @@ STRICT_ADMIN="${STRICT_ADMIN:-true}"
 # socket 权限：默认 0600（仅 root 可连；飞牛网关 trim_http_cgi 以 root 运行）。
 SOCKET_MODE="${SOCKET_MODE:-600}"
 SOCKET_GID="${SOCKET_GID:-}"
+# 分版：普通版（无 AI）在构建时把默认值改成 1，二进制就不会注册任何 AI 能力
+AI_DISABLED="${AI_DISABLED:-0}"
+# 守护开关：默认开启。排障时可以设 NAS_WEBTERM_NO_SUPERVISE=1 直接前台起服务。
+SUPERVISE="${NAS_WEBTERM_NO_SUPERVISE:-0}"
 
 log_msg() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_FILE}" 2>/dev/null
@@ -134,7 +154,18 @@ is_webterm_pid() {
     local pid="$1"
     [ -n "${pid}" ] || return 1
     [ -r "/proc/${pid}/cmdline" ] || return 1
-    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q 'nas-webterm'
+    # 命令行里带本应用独有的 socket 路径 = 一定是我们的服务；
+    # 兼容老版本（没有 --socket 参数时退回按二进制路径匹配）。
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null |
+        grep -q -e "${APP_SOCKET}" -e "${SERVER_DIR}/nas-webterm"
+}
+
+# 确认这个 pid 是我们的守护进程（避免 pid 复用时误杀）。
+is_supervisor_pid() {
+    local pid="$1"
+    [ -n "${pid}" ] || return 1
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q "__supervise"
 }
 
 kill_pid() {
@@ -157,17 +188,96 @@ kill_pid() {
     return 0
 }
 
+# 清理带本应用标记的终端进程。
+#
+# 正常停止时服务自己会把 PTY 会话杀干净；但如果服务是被 SIGKILL / OOM 干掉的，
+# PTY 里的 shell、后台作业、nohup 出去的进程会变成孤儿继续跑（曾经实测：
+# 关掉标签页后 `sleep 601 &` 仍然活着）。这里按 environ 标记兜底清一遍，
+# 标记由服务在 spawn shell 时写入，子进程会一直继承。
+cleanup_orphan_shells() {
+    local proc pid pids="" hit kv
+    # 与服务端写入的标记完全一致：应用名 + socket 路径。
+    # 用精确匹配而不是前缀，避免把同一个 appname 的开发实例（tools/dev.sh）也清掉。
+    local tag="NAS_WEBTERM_APP=${APP_NAME}|${APP_SOCKET}"
+    for proc in /proc/[0-9]*/environ; do
+        pid="${proc#/proc/}"
+        pid="${pid%/environ}"
+        case "${pid}" in
+            '' | *[!0-9]*) continue ;;
+        esac
+        [ "${pid}" -le 1 ] && continue
+        [ "${pid}" = "$$" ] && continue
+        # 用 bash 内建 read 直接读 environ（NUL 分隔），不 fork tr/grep：
+        # 全机几百个进程时，逐进程 fork 两个外部命令要花 1~2 秒。
+        # 重定向顺序必须是 2>/dev/null 在前：进程刚好退出时 bash 才会把
+        # "No such process" 吞掉，而不是打到脚本输出里。
+        hit=0
+        while IFS= read -r -d '' kv; do
+            if [ "${kv}" = "${tag}" ]; then
+                hit=1
+                break
+            fi
+        done 2>/dev/null < "${proc}"
+        [ "${hit}" = "1" ] && pids="${pids} ${pid}"
+    done
+    [ -z "${pids}" ] && return 0
+    log_msg "cleaning orphan terminal processes:${pids}"
+    for pid in ${pids}; do
+        kill -TERM "${pid}" 2>/dev/null || true
+    done
+    sleep 0.3
+    for pid in ${pids}; do
+        if check_process "${pid}"; then
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    done
+    return 0
+}
+
 stop_all() {
-    local pid extra
+    local sup pid extra i
+
+    # 1) 先停守护进程：它会先给服务发 SIGTERM（服务优雅退出并收掉全部会话）
+    sup="$(read_pid "${SUP_PID_FILE}" || true)"
+    if [ -n "${sup}" ] && check_process "${sup}" && is_supervisor_pid "${sup}"; then
+        : > "${STOP_FLAG}" 2>/dev/null || true
+        log_msg "stopping supervisor (pid=${sup})"
+        kill -TERM "${sup}" 2>/dev/null || true
+        for ((i = 0; i < 150; i++)); do
+            check_process "${sup}" || break
+            sleep 0.1
+        done
+        if check_process "${sup}"; then
+            log_msg "force killing supervisor (pid=${sup})"
+            kill -KILL "${sup}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${SUP_PID_FILE}"
+
+    # 2) 服务进程（守护进程被强杀时它还活着）
     pid="$(read_pid "${PID_FILE}" || true)"
     kill_pid "${pid}" "webterm"
     rm -f "${PID_FILE}" "${APP_SOCKET}"
 
-    # pid 文件丢失时按唯一路径兜底清理，避免残留进程占用 socket
+    # 3) pid 文件丢失时按唯一路径兜底清理，避免残留进程占用 socket
     for extra in $(find_pattern_pids "${SERVER_DIR}/nas-webterm"); do
         kill_pid "${extra}" "webterm (orphan)"
         rm -f "${APP_SOCKET}"
     done
+
+    # 4) 守护进程兜底：pid 文件丢了（写盘失败 / 被误删）也要把它停掉，
+    #    否则它会立刻把服务重新拉起来，用户看起来就是「stop 没生效」。
+    #    用完整路径匹配，避免误杀另一个变体（nas-webterm-ai）的守护进程。
+    for extra in $(find_pattern_pids "${SELF} __supervise"); do
+        if is_supervisor_pid "${extra}"; then
+            log_msg "stopping supervisor (orphan, pid=${extra})"
+            kill -TERM "${extra}" 2>/dev/null || true
+        fi
+    done
+
+    # 5) 最后一层：按环境标记清理终端进程（服务崩溃时留下的 shell / 后台作业）
+    cleanup_orphan_shells
+    rm -f "${STOP_FLAG}"
     return 0
 }
 
@@ -179,26 +289,28 @@ is_running() {
     return 0
 }
 
-start_all() {
-    if is_running; then
-        log_msg "already running, skip start"
-        exit 0
-    fi
+acquire_lock() {
+    local waited=0
+    while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+        # 上一次 start 被 kill -9 时会留下锁目录：超过 60 秒视为过期
+        if [ -d "${LOCK_DIR}" ] && [ -n "$(find "${LOCK_DIR}" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "${LOCK_DIR}" 2>/dev/null || true
+            continue
+        fi
+        waited=$((waited + 1))
+        [ "${waited}" -gt 100 ] && return 1
+        sleep 0.1
+    done
+    return 0
+}
 
-    stop_all
+release_lock() {
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+}
 
-    local binary
-    if ! binary="$(pick_binary)"; then
-        fail_msg "未找到可执行文件（架构 $(detect_arch)），请重新安装 Web 终端。"
-        exit 1
-    fi
-
-    if [ ! -f "${UI_DIR}/index.html" ]; then
-        fail_msg "前端资源缺失：${UI_DIR}/index.html，请重新安装 Web 终端。"
-        exit 1
-    fi
-
-    local -a args=(
+# 构造服务参数（start 与 __supervise 共用）
+build_args() {
+    ARGS=(
         --socket "${APP_SOCKET}"
         --ui-dir "${UI_DIR}"
         --gateway-prefix "/app/${APP_NAME}"
@@ -217,22 +329,169 @@ start_all() {
     # （info.log → info.log.1 → info.log.2）。
     # 服务端配了 --log-file 之后只写文件、不再写 stderr，所以不会和下面
     # 的 `>> "${LOG_FILE}" 2>&1` 重定向重复（那一路只兜 panic 之类的输出）。
-    args+=(--log-file "${LOG_FILE}")
+    ARGS+=(--log-file "${LOG_FILE}")
+    if [ "${AI_DISABLED}" = "1" ]; then
+        ARGS+=(--no-ai)
+    else
+        ARGS+=(--ai-config "${PKG_VAR}/ai.json")
+    fi
     if [ -n "${SOCKET_GID}" ]; then
-        args+=(--socket-gid "${SOCKET_GID}")
+        ARGS+=(--socket-gid "${SOCKET_GID}")
+    fi
+}
+
+prepare_binary() {
+    if ! BINARY="$(pick_binary)"; then
+        fail_msg "未找到可执行文件（架构 $(detect_arch)），请重新安装 Web 终端。"
+        return 1
+    fi
+    if [ ! -f "${UI_DIR}/index.html" ]; then
+        fail_msg "前端资源缺失：${UI_DIR}/index.html，请重新安装 Web 终端。"
+        return 1
+    fi
+    build_args
+    return 0
+}
+
+# 在独立会话里启动自己（supervise 模式），关掉启动它的终端也不会被 SIGHUP 带走
+spawn_supervisor() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid --fork "${SELF}" __supervise >> "${LOG_FILE}" 2>&1 < /dev/null
+    else
+        nohup "${SELF}" __supervise >> "${LOG_FILE}" 2>&1 < /dev/null &
+    fi
+}
+
+start_all() {
+    if is_running; then
+        log_msg "already running, skip start"
+        exit 0
     fi
 
-    log_msg "starting ${binary} (arch=$(detect_arch), shell=${DEFAULT_SHELL}, cmd=${STARTUP_COMMAND:-none})"
-    nohup "${binary}" "${args[@]}" >> "${LOG_FILE}" 2>&1 &
-    printf '%s' "$!" > "${PID_FILE}"
+    if ! acquire_lock; then
+        log_msg "another start is in progress, skip"
+        exit 0
+    fi
+    # shellcheck disable=SC2064
+    trap 'release_lock' EXIT
+    trap 'release_lock; exit 1' INT TERM
 
-    if ! wait_socket "${APP_SOCKET}" 30; then
+    stop_all
+
+    prepare_binary || exit 1
+
+    if [ "${SUPERVISE}" = "1" ]; then
+        # 排障模式：直接前台跑，不守护（进程退出 start 就结束）
+        log_msg "starting ${BINARY} (no supervise, arch=$(detect_arch), shell=${DEFAULT_SHELL}, cmd=${STARTUP_COMMAND:-none})"
+        # exec：让脚本进程直接被服务替换，pid 文件里的号才对应真正的服务进程，
+        # stop / Ctrl+C 的 SIGTERM 才会打到服务自己（否则只杀掉了外层脚本）。
+        release_lock
+        printf '%s' "$$" > "${PID_FILE}"
+        exec "${BINARY}" "${ARGS[@]}" >> "${LOG_FILE}" 2>&1
+    fi
+
+    rm -f "${STOP_FLAG}"
+    log_msg "starting supervisor (arch=$(detect_arch), shell=${DEFAULT_SHELL}, cmd=${STARTUP_COMMAND:-none})"
+    spawn_supervisor
+
+    # 等服务真正可用：socket 出现 + 进程活着。
+    # 旧实现只等 socket 30 秒，服务起不来时要白等满 30 秒才报错。
+    local i ok=0 sup
+    for ((i = 0; i < 300; i++)); do
+        if [ -S "${APP_SOCKET}" ] && is_running; then
+            ok=1
+            break
+        fi
+        sup="$(read_pid "${SUP_PID_FILE}" || true)"
+        if [ -n "${sup}" ] && ! check_process "${sup}"; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "${ok}" != "1" ]; then
         fail_msg "Web 终端启动失败，请查看日志 ${LOG_FILE}。"
         stop_all
         exit 1
     fi
 
-    log_msg "nas-webterm started (pid=$(cat "${PID_FILE}" 2>/dev/null))"
+    log_msg "nas-webterm started (pid=$(cat "${PID_FILE}" 2>/dev/null), supervisor=$(cat "${SUP_PID_FILE}" 2>/dev/null))"
+    exit 0
+}
+
+# 守护循环：服务退出（崩溃 / 被 OOM / 被误杀）后自动拉起，退避 1→60 秒。
+supervise_loop() {
+    local backoff=1 started uptime rc child=""
+    # 关掉作业控制提示：子进程被 SIGKILL 时 bash 会往 stderr 打一行 "Killed"，
+    # 那行会混进 info.log，看起来像服务自己报错。
+    set +m
+    trap 'supervisor_stop ${child}' TERM INT QUIT HUP
+
+    printf '%s' "$$" > "${SUP_PID_FILE}"
+    log_msg "supervisor started (pid=$$, app=${APP_NAME})"
+
+    while :; do
+        [ -e "${STOP_FLAG}" ] && break
+        if ! prepare_binary; then
+            rm -f "${SUP_PID_FILE}"
+            exit 1
+        fi
+
+        started="$(date +%s)"
+        # 子进程自己写日志（--log-file）；这里的重定向只兜 panic / 启动失败的输出
+        "${BINARY}" "${ARGS[@]}" >> "${LOG_FILE}" 2>&1 &
+        child=$!
+        printf '%s' "${child}" > "${PID_FILE}"
+        log_msg "supervisor: service started (pid=${child})"
+
+        wait "${child}" 2>/dev/null
+        rc=$?
+
+        # wait 被信号打断时子进程可能还活着：trap 里会处理停止
+        if [ -e "${STOP_FLAG}" ]; then
+            break
+        fi
+        if check_process "${child}"; then
+            wait "${child}" 2>/dev/null
+            rc=$?
+        fi
+
+        rm -f "${PID_FILE}" "${APP_SOCKET}"
+        uptime=$(($(date +%s) - started))
+        # 稳定运行超过 60 秒说明不是启动即崩，退避归零
+        if [ "${uptime}" -ge 60 ]; then
+            backoff=1
+        fi
+        log_msg "supervisor: service exited (pid=${child}, rc=${rc}, uptime=${uptime}s), restarting in ${backoff}s"
+        # 后台 sleep + wait：收到 TERM 时能立刻醒来，不会卡在 sleep 里
+        sleep "${backoff}" &
+        wait $!
+        if [ "${backoff}" -lt 60 ]; then
+            backoff=$((backoff * 2))
+        fi
+    done
+
+    rm -f "${PID_FILE}" "${SUP_PID_FILE}" "${STOP_FLAG}"
+    log_msg "supervisor exited"
+    exit 0
+}
+
+supervisor_stop() {
+    local child="${1:-}" i
+    : > "${STOP_FLAG}" 2>/dev/null || true
+    if [ -n "${child}" ] && check_process "${child}"; then
+        log_msg "supervisor: stopping service (pid=${child})"
+        kill -TERM "${child}" 2>/dev/null || true
+        for ((i = 0; i < 80; i++)); do
+            check_process "${child}" || break
+            sleep 0.1
+        done
+        if check_process "${child}"; then
+            log_msg "supervisor: force killing service (pid=${child})"
+            kill -KILL "${child}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${PID_FILE}" "${SUP_PID_FILE}" "${STOP_FLAG}"
     exit 0
 }
 
@@ -245,14 +504,22 @@ case "${1:-}" in
         log_msg "nas-webterm stopped"
         exit 0
         ;;
+    restart)
+        stop_all
+        start_all
+        ;;
     status)
         if is_running; then
             exit 0
         fi
         exit 3
         ;;
+    __supervise)
+        # 内部命令：由 start 通过 setsid 拉起，不要手工调用
+        supervise_loop
+        ;;
     *)
-        echo "usage: $0 {start|stop|status}" >&2
+        echo "usage: $0 {start|stop|restart|status}" >&2
         exit 1
         ;;
 esac

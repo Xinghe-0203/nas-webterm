@@ -9,6 +9,11 @@ pub const C_INPUT: u8 = 0x01;
 pub const C_RESIZE: u8 = 0x02;
 /// 客户端 → 服务端：发送信号，JSON `{"signal":"INT"}`
 pub const C_SIGNAL: u8 = 0x03;
+/// 客户端 → 服务端：终端对 OSC/DA 查询的自动应答。
+///
+/// 必须和普通键盘输入区分开：服务端会核对这是否来自仍在读取输入的
+/// 发起进程；核对不通过就丢弃，绝不能写进 Shell 的 stdin。
+pub const C_TERM_RESPONSE: u8 = 0x05;
 
 /// 服务端 → 客户端：终端输出
 pub const S_OUTPUT: u8 = 0x01;

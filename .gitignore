@@ -22,3 +22,10 @@ tools/fnpack
 # 系统垃圾
 .DS_Store
 *.log
+
+# 代码扫描工具的本地状态（不进版本库）
+.mimosa/
+
+# 临时探测页（clipboard 诊断用，不进包）
+app/ui/iframe-clipboard-probe.html
+tools/iframe-clipboard-probe.html

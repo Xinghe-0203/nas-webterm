@@ -24,7 +24,9 @@ async function boot(): Promise<void> {
   try {
     const res = await fetch(`${base}api/config`, { credentials: 'same-origin' });
     const json = await res.json();
-    if (json?.ok) startupCommand = String(json.data?.startupCommand ?? '');
+    if (json?.ok) {
+      startupCommand = String(json.data?.startupCommand ?? '');
+    }
   } catch {
     /* 配置拉取失败不阻塞终端 */
   }

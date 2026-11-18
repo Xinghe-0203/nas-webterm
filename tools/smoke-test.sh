@@ -17,9 +17,18 @@ PASS=0
 FAIL=0
 
 cleanup() {
-    if [ -f "${TMP_DIR}/var/webterm.pid" ]; then
-        kill "$(cat "${TMP_DIR}/var/webterm.pid" 2>/dev/null)" 2>/dev/null || true
+    # 现在 cmd/main start 拉起的是「守护进程 + 服务进程」两层：
+    # 只杀服务进程的话守护进程会立刻把它重新拉起来，测试目录删不掉。
+    # 这里直接走 stop（幂等），再兜底按 pid 杀一次。
+    if [ -n "${TRIM_APPDEST:-}" ] && [ -x "${ROOT}/cmd/main" ]; then
+        "${ROOT}/cmd/main" stop >/dev/null 2>&1 || true
     fi
+    local f
+    for f in "${TMP_DIR}/var/webterm.sup.pid" "${TMP_DIR}/var/webterm.pid"; do
+        if [ -f "${f}" ]; then
+            kill -KILL "$(cat "${f}" 2>/dev/null)" 2>/dev/null || true
+        fi
+    done
     rm -rf "${TMP_DIR}"
 }
 
@@ -47,12 +56,26 @@ case "${ARCH}" in
     *) ARCH_TAG="${ARCH}" ;;
 esac
 
-SRC_BIN="${WT_BIN:-${ROOT}/rust/target/release/nas-webterm}"
+# 被测二进制：可以用 WT_BIN 指定，否则按变体找（dist/<variant>/app/server/…）
+VARIANT="${1:-plain}"
+SRC_BIN="${WT_BIN:-}"
+if [ -z "${SRC_BIN}" ]; then
+    for cand in \
+        "${ROOT}/dist/${VARIANT}/app/server/nas-webterm-$(uname -m | sed 's/arm64/aarch64/')" \
+        "${ROOT}/rust/target/release/nas-webterm"; do
+        if [ -x "${cand}" ]; then SRC_BIN="${cand}"; break; fi
+    done
+fi
 [ -x "${SRC_BIN}" ] || fail_exit "未找到后端二进制 ${SRC_BIN}，请先执行 cargo build --release"
 
 mkdir -p "${TMP_DIR}/target/server" "${TMP_DIR}/target/ui" "${TMP_DIR}/var" "${TMP_DIR}/home" "${TMP_DIR}/tmp"
 cp "${SRC_BIN}" "${TMP_DIR}/target/server/nas-webterm-${ARCH_TAG}"
-cp -r "${ROOT}/app/ui/." "${TMP_DIR}/target/ui/"
+# 前端资源：优先用变体目录里的（那才是最终交付的那份），否则用构建目录的
+if [ -d "${ROOT}/dist/${VARIANT}/app/ui" ]; then
+    cp -r "${ROOT}/dist/${VARIANT}/app/ui/." "${TMP_DIR}/target/ui/"
+else
+    cp -r "${ROOT}/app/ui/." "${TMP_DIR}/target/ui/"
+fi
 
 export TRIM_APPDEST="${TMP_DIR}/target"
 export TRIM_PKGVAR="${TMP_DIR}/var"

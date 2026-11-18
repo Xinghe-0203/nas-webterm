@@ -180,6 +180,23 @@ macro_rules! log_info {
     ($($arg:tt)*) => { $crate::log::write("INFO", &format!($($arg)*)) };
 }
 
+/// 终端查询/应答路由的调试日志：默认关闭，设置 `NAS_WEBTERM_DEBUG=1`
+/// 后写入同一份 info.log（不会污染终端输入输出）。
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        if $crate::log::debug_enabled() {
+            $crate::log::write("DEBUG", &format!($($arg)*));
+        }
+    };
+}
+
+/// 调试日志开关（进程内只读一次环境变量）。
+pub fn debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NAS_WEBTERM_DEBUG").is_some())
+}
+
 #[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => { $crate::log::write("WARN", &format!($($arg)*)) };
