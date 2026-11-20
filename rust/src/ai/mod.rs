@@ -17,6 +17,8 @@
 pub mod routes;
 pub mod agent;
 pub mod history;
+pub mod protocol;
+pub mod events;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

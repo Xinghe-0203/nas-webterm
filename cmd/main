@@ -27,10 +27,52 @@ set -u
 
 APP_NAME="nas-webterm"
 # 与 manifest / rust/Cargo.toml 保持一致；构建脚本会按 manifest 再同步一次
-APP_VERSION="1.2.5"
+APP_VERSION="1.2.6"
 PKG_DEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
 PKG_VAR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
 PKG_HOME="${TRIM_PKGHOME:-/var/apps/${APP_NAME}/home}"
+
+# 环境变量指向的必须是**本应用**的目录。
+#
+# 为什么要有这道检查：fnOS 在某些批量启停场景下会把 A 应用的
+# TRIM_APPDEST/TRIM_PKGVAR 传给 B 应用的脚本。日志里就出现过
+# 「微信时光机」的 stop 消息写进了本应用的 info.log——两边都用
+# ${TRIM_PKGVAR:-...}，变量一串，日志、数据、pid 文件就都写到
+# 别人家里去了（更糟的是可能停掉别人的服务）。
+#
+# 这里识别不了自己的目录就**拒绝执行**：宁可启动失败，也不能
+# 动到别的应用的数据。
+# 路径的最后一段必须属于本应用（nas-webterm / nas-webterm-ai 都算）。
+#
+# 这里用「以本名开头」判断：fnOS 的应用目录名就是 appname，
+# 变体是 appname 加后缀（nas-webterm-ai）。别的应用（wx-vault 等）
+# 名字不以本名开头，一律拒绝。
+env_path_is_ours() {
+    local path="$1"
+    # 路径里必须有一段是本应用名（nas-webterm / nas-webterm-ai）。
+    # /var/apps/<app>/target、/vol2/@appdata/<app>/… 都能匹配上。
+    local IFS='/'
+    local seg
+    for seg in ${path}; do
+        case "${seg}" in
+            "${APP_NAME}" | "${APP_NAME}"-*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+check_env_owned_by_app() {
+    local kind="$1" path="$2"
+    if env_path_is_ours "${path}"; then
+        return 0
+    fi
+    printf '[%s] 环境变量 %s=%s 不属于本应用（%s），拒绝执行以免写坏别的应用的数据\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${kind}" "${path}" "${APP_NAME}" >&2
+    exit 1
+}
+check_env_owned_by_app TRIM_APPDEST "${PKG_DEST}"
+check_env_owned_by_app TRIM_PKGVAR "${PKG_VAR}"
+check_env_owned_by_app TRIM_PKGHOME "${PKG_HOME}"
 SERVER_DIR="${PKG_DEST}/server"
 UI_DIR="${PKG_DEST}/ui"
 APP_SOCKET="${PKG_DEST}/app.sock"

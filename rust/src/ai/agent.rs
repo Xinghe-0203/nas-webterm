@@ -8,12 +8,13 @@
 //! （`Session::output_seq` / `output_since`）。放前端只能靠猜。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
+use crate::ai::events::{EventBus, GraceTimer};
 use crate::ai::history::{now_millis, ChatHistory, HistoryBlock, HistoryCommand, HistoryTurn};
 use crate::ai::{self, AiConfig, ChatMessage};
 use crate::session::Session;
@@ -76,6 +77,13 @@ struct TurnRecorder {
     /// 只收「已经发给前端」的文本，所以不会把那些被扣住、最后没展示的
     /// 提前总结也塞进上下文。
     assistant: String,
+    /// 协议标签的**增量**过滤器。
+    ///
+    /// 流式分片可能把标签切成 `<exe` + `cute_command>` 两半；如果对每一片
+    /// 单独做 strip，前半片被清掉、后半片却会原样留下（历史里就出现
+    /// `cute_command>` 这种新垃圾）。这里保持跨片状态，直到闭合标签出现
+    /// 才整段丢弃。
+    filter: crate::ai::protocol::ProtocolFilter,
     /// 是否已经写进存储（save 幂等；Drop 里再兜一次）
     saved: bool,
 }
@@ -88,6 +96,7 @@ impl TurnRecorder {
             user,
             blocks: Vec::new(),
             assistant: String::new(),
+            filter: crate::ai::protocol::ProtocolFilter::new(),
             saved: false,
         }
     }
@@ -101,6 +110,10 @@ impl TurnRecorder {
             return;
         }
         self.saved = true;
+        // 收尾：把过滤器里扣住的普通文字放出来，没闭合的标签碎片丢掉。
+        // 不做这一步，最后一句如果正好停在 `<` 上，就会丢字。
+        let tail = self.filter.finish();
+        self.append_safe(&tail);
         if self.assistant.trim().is_empty() && self.blocks.is_empty() {
             return;
         }
@@ -117,6 +130,23 @@ impl TurnRecorder {
     ///
     /// 连续的文字会合并成一块，回放时就是一段话而不是一堆碎片。
     fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // 必须**过滤协议标签**：前端有 ToolFilter，界面上看不到
+        // `<execute_command>`，但存进聊天记录的是服务端这份原文。
+        // 少了这道过滤，历史里会出现 `<execute` 这种半截标签碎片
+        // （模型分片输出时标签还没写完就被记下来了），
+        // 还会污染下一轮喂给模型的上下文。
+        //
+        // 用**增量**过滤器（不是对每一片单独 strip）：标签可能被切在
+        // 两片之间，逐片清理会把后半片漏成 `cute_command>` 这类碎片。
+        let safe = self.filter.push(text);
+        self.append_safe(&safe);
+    }
+
+    /// 把过滤器放行的那部分文本记下来（多片会合并成一个文字块）。
+    fn append_safe(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -175,6 +205,30 @@ impl TurnRecorder {
     }
 }
 
+/// 任务结束时把事件总线标记为完成：订阅者的流自然收尾。
+///
+/// 用 Drop 保证所有退出路径（正常结束 / 出错 / 客户端走人）都覆盖到，
+/// 不会出现「前端一直转圈等 done」的情况。
+struct DoneGuard {
+    bus: Arc<EventBus>,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        // 统一兜底发一条 done 再收尾。
+        //
+        // 任务有十来个提前结束的出口（模型报错、命令超时停不下来、宽限期
+        // 到了、用户停止、PTY 写失败……），逐个补 done 很容易漏一个；
+        // 漏了的话，断线重连的客户端把缓冲里的事件读完、连接一断，
+        // 界面会停在「执行中」。前端对重复的 done 已经去重。
+        let _ = self.bus.publish(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "done"})
+        ));
+        self.bus.mark_done();
+    }
+}
+
 impl Drop for TurnRecorder {
     fn drop(&mut self) {
         // 正常路径已经在发 done 之前 save 过了；这里兜住所有提前 return
@@ -192,8 +246,28 @@ pub struct AgentRun {
     pending: Mutex<Option<(PendingCommand, oneshot::Sender<(Decision, Option<String>)>)>>,
     /// 当前步骤号（前端用来对齐卡片）
     step: AtomicU64,
-    /// 是否已结束
+    /// 是否已结束（done 已发出，可以开始新任务）
     finished: Mutex<bool>,
+    /// 结束时刻：用于判断「客户端重试」的时间窗口
+    finished_at: Mutex<Option<std::time::Instant>>,
+    /// 事件总线：事件先存下来再广播，客户端断线重连能补上漏掉的
+    bus: Arc<EventBus>,
+    /// 客户端掉线宽限计时
+    grace: GraceTimer,
+    /// 用户点了「停止」：不等宽限期，立刻收尾
+    cancelled: AtomicBool,
+    /// 本次任务的用户请求原文：用来判断「重发的同一条请求」
+    user_text: Mutex<String>,
+    /// 客户端生成的请求 id：同一条消息的所有重试共用一个 id。
+    ///
+    /// 光靠「文本相同」判断重试会误伤：用户 30 秒内又问了一遍同样的话
+    /// 会被当成重试、直接回放旧答案。请求 id 能精确区分「同一次请求的重试」
+    /// 和「用户真的又发了一条」。
+    request_id: Mutex<String>,
+    /// 本次任务写入的聊天会话 id（断线重连时回给前端，避免上下文分裂）
+    conversation_id: Mutex<String>,
+    /// 用户点「停止」时唤醒所有等待点（模型流 / 等审批 / 等命令）
+    stop_notify: tokio::sync::Notify,
 }
 
 impl AgentRun {
@@ -204,12 +278,121 @@ impl AgentRun {
             created: std::time::Instant::now(),
             pending: Mutex::new(None),
             step: AtomicU64::new(0),
+
             finished: Mutex::new(false),
+            finished_at: Mutex::new(None),
+            bus: Arc::new(EventBus::new()),
+            grace: GraceTimer::new(),
+            cancelled: AtomicBool::new(false),
+            user_text: Mutex::new(String::new()),
+            request_id: Mutex::new(String::new()),
+            conversation_id: Mutex::new(String::new()),
+            stop_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// 本次请求的客户端 id（空 = 老客户端，只能按文本判断重试）。
+    pub fn request_id(&self) -> String {
+        self.request_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 记录客户端请求 id（任务开始时同步设置）。
+    pub fn set_request_id(&self, id: &str) {
+        *self.request_id.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string();
+    }
+
+    /// 本次任务写入的聊天会话 id。
+    pub fn conversation_id(&self) -> String {
+        self.conversation_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 记录聊天会话 id（任务开始前同步设置）。
+    pub fn set_conversation_id(&self, id: &str) {
+        *self.conversation_id.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string();
+    }
+
+    /// 本次任务的用户请求原文。
+    pub fn user_text(&self) -> String {
+        self.user_text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 记录用户请求原文（任务开始时调用一次）。
+    pub fn set_user_text(&self, text: &str) {
+        *self.user_text.lock().unwrap_or_else(|e| e.into_inner()) = text.to_string();
+    }
+
+    /// 事件总线（客户端断线重连要靠它补发漏掉的事件）。
+    pub fn bus(&self) -> Arc<EventBus> {
+        self.bus.clone()
+    }
+
+    /// 用户点了「停止」：不等宽限期，立刻收尾。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        // 唤醒所有还在等的地方：不唤醒的话，等审批 / 等命令的分支
+        // 要等到超时（最长 10 分钟）才会发现「用户已经点了停止」。
+        self.stop_notify.notify_waiters();
+    }
+
+    /// 是否被用户叫停。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 等到「用户点了停止」为止（已经停止时立即返回）。
+    ///
+    /// 先注册通知再检查标记：cancel() 可能正好发生在两者之间，
+    /// 顺序反了会漏掉这一次唤醒，等审批的分支就又要干等 10 分钟。
+    pub async fn wait_stop(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.stop_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+
+    /// 客户端是否还在看。
+    ///
+    /// 还在 → 正常跑；不在了 → 最多等宽限期，等它回来接着跑。
+    /// 返回 false 表示该收尾了（宽限期过了，或用户点了停止）。
+    pub async fn wait_client(&self) -> bool {
+        loop {
+            if self.is_cancelled() {
+                return false;
+            }
+            if self.bus.has_subscribers() {
+                self.grace.seen();
+                return true;
+            }
+            self.grace.gone();
+            if self.grace.expired() {
+                return false;
+            }
+            // 用 select 而不是纯 sleep：用户点停止时立刻醒来，
+            // 不用再等最多 200ms 的轮询间隔。
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                _ = self.wait_stop() => {}
+            }
         }
     }
 
     /// 前端提交审批结果。返回 false 表示没有待审批的命令（可能已超时）。
     pub fn decide(&self, decision: Decision, command: Option<String>) -> bool {
+        if matches!(decision, Decision::Stop) {
+            self.cancel();
+        }
         let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         match guard.take() {
             Some((_, tx)) => {
@@ -220,7 +403,26 @@ impl AgentRun {
         }
     }
 
-    fn is_finished(&self) -> bool {
+    /// 还认不认这个任务。
+    ///
+    /// * 还在跑 → 认；
+    /// * 刚结束（30 秒内）→ 也认：客户端可能正好在「done 之后、结果收到之前」
+    ///   掉了连接，带着同一条请求重试，这时要接回原结果而不是重跑一遍；
+    /// * 结束很久了 → 不认，当成新任务（用户可能真的又问了一遍同样的话）。
+    fn is_retryable(&self) -> bool {
+        if !self.is_finished() {
+            return true;
+        }
+        let at = *self.finished_at.lock().unwrap_or_else(|e| e.into_inner());
+        at.map(|t| t.elapsed() < std::time::Duration::from_secs(30))
+            .unwrap_or(false)
+    }
+
+    /// 任务是否已结束（done 已发出）。
+    ///
+    /// 用它在「能不能开始新任务」的判断上：done 之后前端就会允许用户
+    /// 发下一条消息，服务端必须同步放开，否则新消息会被 409 拦住。
+    pub fn is_finished(&self) -> bool {
         *self.finished.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -250,8 +452,9 @@ impl AgentStore {
     /// 的 busy 状态（那只管得住当前页面）。
     pub fn create(&self, sid: &str) -> Result<Arc<AgentRun>, String> {
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        // 顺手清掉已结束 / 僵尸任务，避免长期累积（每个 run 都会抓住一个 Session 引用）
-        runs.retain(|_, r| !r.is_finished() && !r.is_stale());
+        // 顺手清掉已结束 / 僵尸任务，避免长期累积（每个 run 都会抓住一个 Session 引用）。
+        // 已结束的留 30 秒：客户端可能刚好在 done 之后重试，要能接回原结果。
+        runs.retain(|_, r| r.is_retryable() && !r.is_stale());
         if runs.values().any(|r| r.sid == sid) {
             return Err("该会话已有 AI 任务正在运行，请等它结束或先停止".to_string());
         }
@@ -259,6 +462,27 @@ impl AgentStore {
         let run = Arc::new(AgentRun::new(id.clone(), sid.to_string()));
         runs.insert(id, run.clone());
         Ok(run)
+    }
+
+    /// 把一个任务从表里移除（任务已完成、且要开始新任务时用）。
+    pub fn remove(&self, id: &str) {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// 找出这个会话上的任务（包括刚结束、事件还没读完的）。
+    ///
+    /// 为什么连「已结束」的也要返回：客户端可能正好在任务跑完、
+    /// 响应丢失的瞬间重试，此时它的结果还在事件缓冲里。如果这里直接
+    /// 看不到它，服务端会当成新任务再跑一遍——同一串命令就被执行两次。
+    /// 调用方会先比对「是不是同一条请求」，不是的话再把旧任务清掉。
+    pub fn find_by_sid(&self, sid: &str) -> Option<Arc<AgentRun>> {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.values()
+            .find(|r| r.sid == sid && !r.is_stale() && r.is_retryable())
+            .cloned()
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<AgentRun>> {
@@ -269,8 +493,21 @@ impl AgentStore {
             .cloned()
     }
 
+    /// 标记任务「逻辑上已结束」。
+    ///
+    /// 只是让 `create()` 知道这个会话可以开始新任务了；事件流仍然开着，
+    /// 客户端还能把最后的输出读完（`is_done` 才是真正的收尾）。
     pub fn finish(&self, id: &str) {
         if let Some(run) = self.get(id) {
+            // 先记结束时刻再置 finished：反过来的话，存在一个极短的窗口
+            // 「is_finished 为真、finished_at 还是 None」，此时 is_retryable()
+            // 会判 false，客户端带着同一个 runId 重试就接不回原任务了。
+            {
+                let mut at = run.finished_at.lock().unwrap_or_else(|e| e.into_inner());
+                if at.is_none() {
+                    *at = Some(std::time::Instant::now());
+                }
+            }
             *run.finished.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
     }
@@ -306,9 +543,13 @@ pub async fn run_task(
     memory_path: std::path::PathBuf,
     conversation_id: String,
     history_store: Arc<ChatHistory>,
-    tx: mpsc::Sender<String>,
+    bus: Arc<EventBus>,
 ) {
     crate::log_info!("AI agent 任务 {} 开始（会话 {}）：{}", run.id, run.sid, user_text);
+    // 任务结束（无论怎么结束）都要通知总线，让前端的流收尾
+    let _done = DoneGuard {
+        bus: bus.clone(),
+    };
     // 这次任务的一轮对话，结束时写进聊天记录。
     let mut recorder = TurnRecorder::new(history_store, conversation_id, user_text.clone());
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -345,9 +586,7 @@ pub async fn run_task(
     ctx.push_str(&format!("当前 shell 提示符/工作目录参考：{}\n", session.cwd));
     messages.push(serde_json::json!({"role": "user", "content": format!("{}\n\n用户请求：{}", ctx, user_text)}));
 
-    let _ = tx
-        .send(ev(serde_json::json!({"type": "start", "runId": run.id})))
-        .await;
+    let _ = bus.publish(ev(serde_json::json!({"type": "start", "runId": run.id})));
 
     let started = std::time::Instant::now();
     let mut steps_used = 0usize;
@@ -359,12 +598,22 @@ pub async fn run_task(
 
     // 步数按模型上下文窗口分档（1M 窗口 → 64 步），不再写死 12 步
     let max_steps = cfg.max_steps();
+    // 「客户端断开」只记一次：流式循环每片都检查订阅者，
+    // 不控制的话一条长回复会刷出几十条同样的日志。
+    let mut logged_disconnect = false;
     for step in 0..max_steps {
-        // 前端已经断开（关页面 / 点了停止 / 网络断了）：立刻收尾。
-        // 不检查的话任务会继续调模型、继续往 PTY 里写命令——用户已经看不到，
-        // 却还在花 token、还在改机器，而且 AgentRun 会一直挂在 AgentStore 里。
-        if tx.is_closed() {
-            crate::log_info!("AI agent 任务 {} 前端已断开，停止执行（第 {} 步）", run.id, step);
+        // 客户端断开了（关页面 / 网络抖动 / 手机切后台）：不要立刻收尾。
+        // 手机上切一下后台 SSE 就断，原来的行为是任务直接死掉——模型调用
+        // 的钱花了、命令也执行了一半，用户回来只看到半截输出。
+        // 现在改成进入宽限期：等客户端回来接着跑；一直不回来才收尾。
+        // 宽限期内**不会执行新命令**（没人看着时不该继续改机器），
+        // 但当前这一步会跑完并把结果记进聊天记录。
+        if !run.wait_client().await {
+            crate::log_info!(
+                "AI agent 任务 {} 客户端未在宽限期内回来，停止执行（第 {} 步）",
+                run.id,
+                step
+            );
             store.finish(&run.id);
             return;
         }
@@ -380,9 +629,7 @@ pub async fn run_task(
         let mut rx = match ai::call_model_stream(&cfg, &body) {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx
-                    .send(ev(serde_json::json!({"type": "error", "error": e})))
-                    .await;
+                let _ = bus.publish(ev(serde_json::json!({"type": "error", "error": e})));
                 store.finish(&run.id);
                 return;
             }
@@ -400,22 +647,54 @@ pub async fn run_task(
         // `first_command_start` 确认真正的命令位置，避免把普通代码块也永久扣住。
         let mut md_sent = 0usize;
         let mut md_hold: Option<usize> = None;
-        while let Some(evt) = rx.recv().await {
-            if tx.is_closed() {
-                // 松开 rx → curl 子进程被杀掉，不再白跑
-                crate::log_info!("AI agent 任务 {} 前端已断开，中止模型流", run.id);
+        loop {
+            // 等模型下一片，同时能被「停止」唤醒：模型偶尔会停顿好几秒
+            // 才吐下一片，只靠每片检查 cancelled 的话，用户点了停止还要
+            // 干等到下一片来才真正停。
+            let next = tokio::select! {
+                next = rx.recv() => next,
+                _ = run.wait_stop() => None,
+            };
+            let Some(evt) = next else {
+                // 用户点了「停止」：立刻中断模型流，不用等它跑完。
+                // （只是「客户端断开」的话，模型流会继续跑完——钱已经花了，
+                //    输出还能补发给重连的客户端。）
+                if run.is_cancelled() {
+                    crate::log_info!("AI agent 任务 {} 用户点了停止，中止模型流", run.id);
+                } else {
+                    // 模型流正常结束（没有更多事件）
+                    break;
+                }
                 drop(rx);
                 store.finish(&run.id);
                 return;
+            };
+            if run.is_cancelled() {
+                crate::log_info!("AI agent 任务 {} 用户点了停止，中止模型流", run.id);
+                drop(rx);
+                store.finish(&run.id);
+                return;
+            }
+            if !run.bus.has_subscribers() {
+                // 客户端断了，但这次模型调用已经付过钱了：让它跑完，
+                // 输出照样记进聊天记录，客户端回来能补看到。
+                // 只是不再往下走命令——没人看着别改机器。
+                if !logged_disconnect {
+                    logged_disconnect = true;
+                    crate::log_info!(
+                        "AI agent 任务 {} 客户端断开，等待宽限期，模型流继续跑完",
+                        run.id
+                    );
+                }
+            } else {
+                logged_disconnect = false;
             }
             match evt {
                 ai::StreamEvent::Line(line) => {
                     if let Some(d) = ai::parse_sse_line(&line) {
                         if let Some(err) = d.error {
                             let msg = ai::friendly_model_error(&err);
-                            let _ = tx
-                                .send(ev(serde_json::json!({"type": "error", "error": msg})))
-                                .await;
+                            let _ = bus.publish(ev(serde_json::json!({"type": "error", "error": msg})));
                             store.finish(&run.id);
                             return;
                         }
@@ -431,9 +710,7 @@ pub async fn run_task(
                                 if !piece.is_empty() {
                                     // 流式文本：前端把它渲染成面板里的 Markdown
                                     recorder.push_text(&piece);
-                                    let _ = tx
-                                        .send(ev(serde_json::json!({"type": "md", "text": piece})))
-                                        .await;
+                                    let _ = bus.publish(ev(serde_json::json!({"type": "md", "text": piece})));
                                 }
                                 md_sent = emit_to;
                             }
@@ -451,12 +728,10 @@ pub async fn run_task(
             }
         }
         if !ok && acc.is_empty() {
-            let _ = tx
-                .send(ev(serde_json::json!({
+            let _ = bus.publish(ev(serde_json::json!({
                     "type": "error",
                     "error": format!("模型调用失败：{}", ai::friendly_model_error(&stderr)),
-                })))
-                .await;
+                })));
             store.finish(&run.id);
             return;
         }
@@ -490,9 +765,7 @@ pub async fn run_task(
             let piece = acc[md_sent..hold_to].to_string();
             if !piece.trim().is_empty() {
                 recorder.push_text(&piece);
-                let _ = tx
-                    .send(ev(serde_json::json!({"type": "md", "text": piece})))
-                    .await;
+                let _ = bus.publish(ev(serde_json::json!({"type": "md", "text": piece})));
             }
         }
         crate::log_info!(
@@ -506,24 +779,27 @@ pub async fn run_task(
             // 先落盘再发 done：前端收到 done 会立刻允许下一条消息，
             // 若这时会话还没写入，续聊会被当成新会话而断开。
             recorder.save();
-            let _ = tx
-                .send(ev(serde_json::json!({"type": "done", "text": acc.clone()})))
-                .await;
+            let _ = bus.publish(ev(serde_json::json!({"type": "done", "text": acc.clone()})));
             // 先标记 run 结束，再做「长期记忆兜底提取」这个额外的模型请求：
             // 前端已经收到 done、可以立刻发下一条任务，服务端不能还因为旧 run
-            // 没 finish 而返回 409「已有任务正在运行」。
+            // 没结束而返回 409「已有任务正在运行」。
             store.finish(&run.id);
-            finish_with_memory(
-                &cfg,
-                &user_text,
-                &acc,
-                &memory_path,
-                mem_written,
-                &run.id,
-                steps_used,
-                started,
-            )
-            .await;
+            // 兜底记忆提取可能还要几秒（又一次模型调用）。放到后台任务里做，
+            // 不占着当前任务的收尾：DoneGuard 会在函数返回时立刻关闭事件流，
+            // 前端不会因为「done 之后还挂着连接」而以为任务没结束。
+            tokio::spawn(async move {
+                finish_with_memory(
+                    &cfg,
+                    &user_text,
+                    &acc,
+                    &memory_path,
+                    mem_written,
+                    &run.id,
+                    steps_used,
+                    started,
+                )
+                .await;
+            });
             return;
         };
 
@@ -531,14 +807,12 @@ pub async fn run_task(
             repeats += 1;
             if repeats >= MAX_REPEAT {
                 recorder.push_text("\n> 该命令已被跳过多次，先停下。换个思路再试。\n");
-                let _ = tx
-                    .send(ev(serde_json::json!({
+                let _ = bus.publish(ev(serde_json::json!({
                         "type": "md",
                         "text": "\n> 该命令已被跳过多次，先停下。换个思路再试。\n",
-                    })))
-                    .await;
+                    })));
                 recorder.save();
-                let _ = tx.send(ev(serde_json::json!({"type": "done"}))).await;
+                let _ = bus.publish(ev(serde_json::json!({"type": "done"})));
                 store.finish(&run.id);
                 return;
             }
@@ -559,14 +833,12 @@ pub async fn run_task(
                 cmd.command, *times
             );
             recorder.push_text(&notice);
-            let _ = tx
-                .send(ev(serde_json::json!({
+            let _ = bus.publish(ev(serde_json::json!({
                     "type": "md",
                     "text": notice,
-                })))
-                .await;
+                })));
             recorder.save();
-            let _ = tx.send(ev(serde_json::json!({"type": "done"}))).await;
+            let _ = bus.publish(ev(serde_json::json!({"type": "done"})));
             crate::log_warn!(
                 "AI agent {} 检测到重复命令循环，停止：{}（第 {} 次）",
                 run.id, cmd.command, *times
@@ -593,8 +865,7 @@ pub async fn run_task(
         // 面板要把「命令 + 目的 + 输出」记录下来，auto 的命令也不该凭空消失。
         // 聊天记录不在这里记：用户可能跳过/停止，没真正执行的命令不该
         // 在历史里显示成「已执行」；等审批完、确定要跑时再记（见下方）。
-        let _ = tx
-            .send(ev(serde_json::json!({
+        let _ = bus.publish(ev(serde_json::json!({
                 "type": "command",
                 "step": step,
                 "runId": run.id,
@@ -604,35 +875,42 @@ pub async fn run_task(
                 "reason": pending.reason,
                 "needsApproval": pending.needs_approval,
                 "auto": auto,
-            })))
-            .await;
+            })));
 
         if !auto {
-            let (ptx, prx) = oneshot::channel();
+            let (ptx, mut prx) = oneshot::channel();
             {
                 let mut guard = run.pending.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some((pending.clone(), ptx));
             }
 
             let decided = tokio::select! {
-                r = tokio::time::timeout(APPROVAL_TIMEOUT, prx) => r,
-                // 前端断开时不要干等 10 分钟审批
-                _ = tx.closed() => {
-                    run.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    crate::log_info!("AI agent 任务 {} 等待审批时前端断开，停止", run.id);
-                    store.finish(&run.id);
-                    return;
+                r = tokio::time::timeout(APPROVAL_TIMEOUT, &mut prx) => Some(r),
+                // 用户点了「停止」：立刻收尾，不用再等审批。
+                _ = run.wait_stop() => None,
+                // 客户端断开时不要干等 10 分钟审批：等它回来接着批，
+                // 宽限期到了就当没人管，收尾。
+                _ = bus.wait_no_subscribers() => {
+                    if !run.wait_client().await {
+                        run.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        crate::log_info!("AI agent 任务 {} 等待审批时客户端未回来，停止", run.id);
+                        store.finish(&run.id);
+                        return;
+                    }
+                    // 客户端回来了：重新等一次审批决定
+                    tokio::select! {
+                        r = tokio::time::timeout(APPROVAL_TIMEOUT, &mut prx) => Some(r),
+                        _ = run.wait_stop() => None,
+                    }
                 }
             };
             let (decision, edited) = match decided {
-                Ok(Ok(v)) => v,
-                // 超时或前端断开：按停止处理
+                Some(Ok(Ok(v))) => v,
+                // 超时 / 用户停止 / 前端断开：按停止处理
                 _ => {
                     run.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
                     recorder.save();
-                    let _ = tx
-                        .send(ev(serde_json::json!({"type": "done"})))
-                        .await;
+                    let _ = bus.publish(ev(serde_json::json!({"type": "done"})));
                     store.finish(&run.id);
                     return;
                 }
@@ -641,7 +919,7 @@ pub async fn run_task(
             match decision {
                 Decision::Stop => {
                     recorder.save();
-                    let _ = tx.send(ev(serde_json::json!({"type": "done"}))).await;
+                    let _ = bus.publish(ev(serde_json::json!({"type": "done"})));
                     store.finish(&run.id);
                     return;
                 }
@@ -662,15 +940,13 @@ pub async fn run_task(
                     // 改完可能变成高危命令，必须重新确认
                     let verdict = ai::classify_for_exec(&c);
                     if verdict.danger && !pending.danger {
-                        let _ = tx
-                            .send(ev(serde_json::json!({
+                        let _ = bus.publish(ev(serde_json::json!({
                                 "type": "error",
                                 "error": format!(
                                     "改后的命令属于高危操作（{}），已放弃执行",
                                     verdict.reason
                                 ),
-                            })))
-                            .await;
+                            })));
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": "用户改后的命令被判定为高危，未执行。请换一个安全的方案。",
@@ -733,38 +1009,48 @@ pub async fn run_task(
         bytes.push(b'\r');
         if let Err(e) = session.write_input(bytes).await {
             recorder.drop_last_command();
-            let _ = tx
-                .send(ev(serde_json::json!({"type": "error", "error": e})))
-                .await;
+            let _ = bus.publish(ev(serde_json::json!({"type": "error", "error": e})));
             store.finish(&run.id);
             return;
         }
-        let _ = tx
-            .send(ev(serde_json::json!({
+        let _ = bus.publish(ev(serde_json::json!({
                 "type": "exec",
                 "step": step,
                 "command": to_run,
-            })))
-            .await;
+            })));
 
         let cmd_started = std::time::Instant::now();
         // 命令等待也要能被「停止 / 关页面」打断：SSE 连接一断开就 Ctrl+C
         // 收尾，不要让用户点了停止后服务端还因为旧任务在等命令而返回 409。
-        let wait_command = async {
+        let mut wait_command = Box::pin(async {
             if marker_supported {
                 session.wait_for_prompt(seq, CMD_TIMEOUT_MS).await
             } else {
                 let (text, _seq2, to) = session.wait_quiet(seq, QUIET_MS, CMD_TIMEOUT_MS).await;
                 (text, None, to)
             }
-        };
+        });
         let (output, exit_code, timed_out) = tokio::select! {
-            r = wait_command => r,
-            _ = tx.closed() => {
+            r = &mut wait_command => r,
+            // 用户点了「停止」：当前命令已经在 PTY 里跑了，先让它跑完
+            // （立刻 Ctrl+C 可能留下半截输出），但不再回灌模型、也不再执行后续命令。
+            _ = run.wait_stop() => {
+                crate::log_info!("AI agent 任务 {} 等待命令时用户点了停止", run.id);
                 let _ = session.write_input(vec![0x03]).await;
-                crate::log_info!("AI agent 任务 {} 等待命令时前端断开，已停止", run.id);
                 store.finish(&run.id);
                 return;
+            }
+            _ = bus.wait_no_subscribers() => {
+                // 命令已经写进 PTY 了，让它跑完；但客户端不在，
+                // 拿到输出后不再回灌模型、也不再执行后续命令。
+                if !run.wait_client().await {
+                    let _ = session.write_input(vec![0x03]).await;
+                    crate::log_info!("AI agent 任务 {} 等待命令时客户端未回来，已停止", run.id);
+                    store.finish(&run.id);
+                    return;
+                }
+                // 客户端回来了：继续等这条命令跑完
+                wait_command.await
             }
         };
         // 超时说明命令可能还在跑（tail -f、交互式程序、卡住的网络命令）。
@@ -787,15 +1073,13 @@ pub async fn run_task(
                     if still_running {
                         // 还停不下来就不能再往 PTY 写命令了：下一条会被这个
                         // 程序当成输入吃掉，表现就是命令乱序、反复循环。
-                        let _ = tx
-                            .send(ev(serde_json::json!({
+                        let _ = bus.publish(ev(serde_json::json!({
                                 "type": "error",
                                 "error": format!(
                                     "命令无法中断，任务已停止：{}（请回到终端手动处理）",
                                     to_run
                                 ),
-                            })))
-                            .await;
+                            })));
                         crate::log_warn!(
                             "AI agent {} 第 {} 步 Ctrl+C 后仍未回到提示符，终止任务：{}",
                             run.id, step, to_run
@@ -817,9 +1101,9 @@ pub async fn run_task(
             cmd_started.elapsed().as_millis(),
             timed_out
         );
-        // 命令已经写进 PTY（只能让它自己跑完），但前端已经走了就没必要再回灌模型。
-        if tx.is_closed() {
-            crate::log_info!("AI agent 任务 {} 命令执行后前端断开，停止", run.id);
+        // 命令已经写进 PTY（只能让它自己跑完），但客户端不在就没必要再回灌模型。
+        if !run.wait_client().await {
+            crate::log_info!("AI agent 任务 {} 命令执行后客户端未回来，停止", run.id);
             store.finish(&run.id);
             return;
         }
@@ -836,15 +1120,13 @@ pub async fn run_task(
         let shown = clamp_chars(&cleaned, 2000);
         // 聊天记录：把这次命令的输出补到刚才那张卡片上
         recorder.fill_command_output(&shown, exit_code, timed_out);
-        let _ = tx
-            .send(ev(serde_json::json!({
+        let _ = bus.publish(ev(serde_json::json!({
                 "type": "observed",
                 "step": step,
                 "timedOut": timed_out,
                 "exitCode": exit_code,
                 "output": shown,
-            })))
-            .await;
+            })));
 
         // 没有输出时也要明确告诉模型「命令是执行完了的」，否则模型容易
         // 把空输出当失败、反复重试同一条命令（cd / export / true 很常见）。
@@ -872,14 +1154,12 @@ pub async fn run_task(
 
     let notice = "\n> 已达到单次任务的步数上限，先停在这里。\n";
     recorder.push_text(notice);
-    let _ = tx
-        .send(ev(serde_json::json!({
+    let _ = bus.publish(ev(serde_json::json!({
             "type": "md",
             "text": notice,
-        })))
-        .await;
+        })));
     recorder.save();
-    let _ = tx.send(ev(serde_json::json!({"type": "done"}))).await;
+    let _ = bus.publish(ev(serde_json::json!({"type": "done"})));
     crate::log_info!(
         "AI agent 任务 {} 结束（达到步数上限 {} 步，耗时 {:?}）",
         run.id,
@@ -1385,6 +1665,60 @@ fn is_in_path(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_keeps_finished_run_for_retry_window() {
+        let store = AgentStore::new();
+        let run = store.create("sid-1").expect("应该能创建");
+        run.set_user_text("看看磁盘");
+        run.set_request_id("req-1");
+        store.finish(&run.id);
+        // 刚结束：同一个会话还能找到它（前端重试要接回原结果）
+        let found = store.find_by_sid("sid-1").expect("30 秒内应该还认得");
+        assert_eq!(found.id, run.id);
+        assert_eq!(found.request_id(), "req-1");
+        // 但这时开新任务不能再被它挡住（done 已发，前端已允许下一条）
+        store.remove(&found.id);
+        assert!(store.create("sid-1").is_ok());
+    }
+
+    #[test]
+    fn store_separates_runs_by_request_id() {
+        let store = AgentStore::new();
+        let run = store.create("sid-2").expect("应该能创建");
+        run.set_request_id("req-a");
+        assert_eq!(run.request_id(), "req-a");
+        // 同一个会话第二个任务会被挡住（会话互斥）
+        assert!(store.create("sid-2").is_err());
+        // 不同会话互不影响
+        assert!(store.create("sid-3").is_ok());
+    }
+
+    #[test]
+    fn recorder_strips_tags_split_across_chunks() {
+        // 标签被切在两片之间：逐片 strip 会漏掉后半片（`cute_command>`），
+        // 增量过滤器必须跨片保持状态，直到闭合标签出现才整段丢弃。
+        let store = Arc::new(ChatHistory::load(None));
+        let mut rec = TurnRecorder::new(store.clone(), "conv-test".to_string(), "看看磁盘".to_string());
+        rec.push_text("先看整体。");
+        rec.push_text("<exec");
+        rec.push_text("ute_command>\n<command>df -h</command>\n</execute_");
+        rec.push_text("command>");
+        rec.push_text("\n看完结论。");
+        rec.save();
+        let conv = store.get("conv-test").expect("应该有聊天记录");
+        assert_eq!(conv.turns.len(), 1);
+        let t = &conv.turns[0];
+        assert!(t.assistant.contains("先看整体"), "正文不能丢: {}", t.assistant);
+        assert!(t.assistant.contains("看完结论"), "后续正文不能丢: {}", t.assistant);
+        assert!(!t.assistant.contains("execute"), "标签碎片必须清掉: {}", t.assistant);
+        // 回放块里也不该有标签
+        for b in &t.blocks {
+            if let HistoryBlock::Text { text } = b {
+                assert!(!text.contains("execute"), "文本块里有标签: {}", text);
+            }
+        }
+    }
 
     #[test]
     fn detect_shell_command() {

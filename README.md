@@ -24,8 +24,8 @@
 1. 从 [Releases](https://github.com/Xinghe-0203/nas-webterm/releases) 下载最新的 `.fpk`；
    也可以自己构建（见第 6 节，产物在 `dist/`）。两个版本任选一个：
 
-   - 普通版：`nas-webterm-1.2.5.fpk`
-   - AI 版：`nas-webterm-ai-1.2.5.fpk`
+   - 普通版：`nas-webterm-1.2.6.fpk`
+   - AI 版：`nas-webterm-ai-1.2.6.fpk`
 
 2. 打开飞牛：**应用中心 → 我的应用 → 手动安装**，选对应的 `.fpk`。
 3. 安装向导直接点下一步（默认值即可）。
@@ -56,6 +56,10 @@
    - 删除、覆盖文件、关机这类危险命令会弹卡片，点 **执行** 才跑。
 5. 命令卡片点标题可以展开，看到完整命令和这次的实际输出。
 6. 面板顶部的 **时钟按钮** 是聊天记录：刷新页面、换浏览器都还在，可以点开以前的对话继续聊。
+
+> **手机切后台、锁屏、网络抖动都不会弄丢任务**：连接断了会自动重连，
+> 断开期间的内容会补发回来，不会重复也不会少。离开超过 2 分钟任务才真正结束
+> （期间不会执行新命令）。
 
 > AI 的 API Key 只存在 NAS 服务端（`${TRIM_PKGVAR}/ai.json`，权限 `0600`），不会发到浏览器。
 
@@ -88,6 +92,7 @@
 | 进程守护 | 服务异常退出后自动重启；关标签页回收整棵进程树 |
 | AI 助手（AI 版） | 自然语言 → 命令 → 审批 → 执行 → 回灌输出 → 总结 |
 | 聊天记录（AI 版） | 每轮对话落盘；刷新/换设备还在；可打开历史继续聊 |
+| 断线不丢任务（AI 版） | 手机切后台 / 网络抖动时任务不中断，自动重连续上，输出不丢不重 |
 | 长期记忆（AI 版） | 模型用 `<remember>` 记住重要信息，跨会话保留 |
 
 ### 两个版本的区别
@@ -165,6 +170,8 @@ curl -s --unix-socket /var/apps/nas-webterm-ai/app.sock \
 | AI 输入没反应 | 先点 ⚙ 填接口地址 / Key / 模型名 |
 | AI 一直不回 | 看 `info.log` 里 AI 相关行；检查 NAS 能否访问模型接口 |
 | AI 命令执行了但终端没变化 | 命令写进当前标签页的 PTY，切到该标签页看，或展开命令卡片看输出 |
+| AI 任务中途断了 | 手机切后台 / 网络抖动导致。1.2.6 起会自动重连续上，输出不丢；宽限期 120 秒内回来都能接上 |
+| 升级后应用打不开 | 用 **应用中心 → 手动安装** 覆盖安装，不要用脚本直接 stop/start |
 | 中文显示方块 | NAS 缺中文字体；浏览器侧问题，装 `fonts-wqy-zenhei` 可解决 |
 
 ---
@@ -206,7 +213,7 @@ nas-webterm/
 ├── manifest                 # 应用清单 / 版本 / changelog
 ├── cmd/                     # 安装、升级、启动、停止脚本
 ├── wizard/                  # 安装向导
-├── rust/src/                # 后端：session / web / ai / agent / history
+├── rust/src/                # 后端：session / web / ai / agent / history / events / protocol
 ├── web/src/                 # 前端：终端、标签、AI 面板
 └── tools/                   # 构建、测试、本地安装脚本
 ```
@@ -214,9 +221,12 @@ nas-webterm/
 测试：
 
 ```bash
-cd rust && cargo test                        # 后端单测
+cd rust && cargo test                        # 后端单测（93 项）
 node tools/verify-ai-history.mjs --url ...   # 聊天记录 22 项
 node tools/verify-ai-history-ui.mjs --url ...# 聊天记录界面 22 项
+node tools/verify-ai-resume.mjs --url ...    # 断线重连 21 项
+node tools/verify-ai-resume-ui.mjs --url ... # 断线重连（浏览器）8 项
+bash tools/verify-env-ownership.sh          # 环境变量归属 5 项
 ```
 
 更多测试脚本见 `tools/verify-*.mjs`，每个脚本开头都有用法说明。
@@ -235,8 +245,9 @@ node tools/verify-ai-history-ui.mjs --url ...# 聊天记录界面 22 项
 
 ## 8. 版本
 
-当前 **1.2.5**，主要更新：
+当前 **1.2.6**，主要更新：
 
+- 1.2.6：AI 任务断线自动重连（手机切后台不再丢输出）、协议标签不再污染聊天记录
 - 1.2.5：AI 聊天记录持久化、聊天记录面板、刷新自动恢复
 - 1.2.4：AI 命令执行可靠性（等命令真正结束、不重复循环）
 - 1.2.3：按模型上下文自动分配预算、审批策略简化

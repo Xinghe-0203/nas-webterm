@@ -135,10 +135,56 @@ impl ChatHistory {
                 Err(e) => crate::log_warn!("AI 聊天记录读取失败: {}", e),
             }
         }
-        Self {
+        // 1.2.5 之前的服务端没有过滤协议标签，历史里可能留着
+        // `<execute` 这种半截标签碎片（界面上的 ToolFilter 挡住了，
+        // 但存盘的是原文）。载入时清一遍，脏数据不会一直留着。
+        //
+        // 注意：要清理两种形态——
+        //   * 整段回复（assistant / 文本块）里的标签；
+        //   * 模型上下文里那条「已执行命令」说明也是自己拼的，不含标签。
+        // 只要清洗结果变了就记一次，用来决定是否写回磁盘。
+        let mut cleaned = 0usize;
+        for c in conversations.iter_mut() {
+            for t in c.turns.iter_mut() {
+                let before: usize = t.assistant.len()
+                    + t.blocks
+                        .iter()
+                        .map(|b| match b {
+                            HistoryBlock::Text { text } => text.len(),
+                            HistoryBlock::Command { .. } => 0,
+                        })
+                        .sum::<usize>();
+                t.assistant = crate::ai::protocol::strip_protocol_tags(&t.assistant);
+                for b in t.blocks.iter_mut() {
+                    if let HistoryBlock::Text { text } = b {
+                        *text = crate::ai::protocol::strip_protocol_tags(text);
+                    }
+                }
+                let after: usize = t.assistant.len()
+                    + t.blocks
+                        .iter()
+                        .map(|b| match b {
+                            HistoryBlock::Text { text } => text.len(),
+                            HistoryBlock::Command { .. } => 0,
+                        })
+                        .sum::<usize>();
+                if after != before {
+                    cleaned += 1;
+                }
+            }
+        }
+        let store = Self {
             path,
             cache: Mutex::new(conversations),
+        };
+        if cleaned > 0 {
+            crate::log_info!("已清理 {} 条聊天记录里的协议标签碎片", cleaned);
+            // 顺手写回磁盘：否则每次启动都要重新清理一遍，
+            // 而且旧文件里的脏数据会一直留着（导出 / 手工查看时会看到）。
+            let guard = store.cache.lock().unwrap_or_else(|e| e.into_inner());
+            store.save(&guard);
         }
+        store
     }
 
     /// 会话列表，按最近更新排序。
@@ -353,7 +399,7 @@ fn preview_of(c: &Conversation) -> String {
             }
         })
         .unwrap_or_default();
-    let cleaned = strip_protocol_tags(&raw);
+    let cleaned = crate::ai::protocol::strip_protocol_tags(&raw);
     let first = cleaned.lines().next().unwrap_or("").trim();
     let mut chars: Vec<char> = first.chars().collect();
     if chars.len() > MAX_PREVIEW_CHARS {
@@ -361,54 +407,6 @@ fn preview_of(c: &Conversation) -> String {
         chars.push('…');
     }
     chars.into_iter().collect()
-}
-
-/// 去掉 `<execute_command>…</execute_command>` 这类协议标签。
-///
-/// 只用于列表摘要（给界面看）；存盘的原文保持不变，模型上下文不受影响。
-///
-/// 手写扫描而不是引正则：项目刻意不引 regex 依赖（交叉编译到 aarch64 时
-/// 依赖树越简单越稳），这里要处理的也只是「成对标签」这一种形态。
-fn strip_protocol_tags(text: &str) -> String {
-    const TAGS: [&str; 2] = ["execute_command", "remember"];
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        // 找最早出现的开标签
-        let mut best: Option<(usize, &str)> = None;
-        for tag in TAGS {
-            if let Some(pos) = rest.find(&format!("<{}", tag)) {
-                if best.map(|(p, _)| pos < p).unwrap_or(true) {
-                    best = Some((pos, tag));
-                }
-            }
-        }
-        let Some((start, tag)) = best else {
-            out.push_str(rest);
-            break;
-        };
-        let after = &rest[start + tag.len() + 1..];
-        let Some(gt) = after.find('>') else {
-            out.push_str(rest);
-            break;
-        };
-        // 开标签名后面必须紧跟空白或 '>'，否则 <remembered> 不算协议标签
-        let attrs = &after[..gt];
-        if !attrs.trim().is_empty() {
-            out.push_str(&rest[..start + tag.len() + 1]);
-            rest = &rest[start + tag.len() + 1..];
-            continue;
-        }
-        let body_start = start + tag.len() + 1 + gt + 1;
-        let close = format!("</{}>", tag);
-        let Some(end) = rest[body_start..].find(&close) else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..start]);
-        rest = &rest[body_start + end + close.len()..];
-    }
-    out.trim().to_string()
 }
 
 #[cfg(test)]
@@ -508,6 +506,35 @@ mod tests {
         let p = preview_of(&c);
         assert!(!p.contains("execute_command"));
         assert!(p.contains("先看磁盘"));
+    }
+
+    #[test]
+    fn load_cleans_protocol_tag_fragments() {
+        let path = tmp_path("clean");
+        let _ = std::fs::remove_file(&path);
+        // 模拟旧版本写下的脏数据：助手文本里有半截标签
+        let mut t = turn("问题", "<execute\n> 已执行命令：df -h\n结果");
+        t.blocks = vec![HistoryBlock::Text {
+            text: "<execute".to_string(),
+        }];
+        let raw = serde_json::to_string_pretty(&vec![Conversation {
+            id: "c1".to_string(),
+            title: "t".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            turns: vec![t],
+        }])
+        .unwrap();
+        std::fs::write(&path, raw).unwrap();
+
+        let store = ChatHistory::load(Some(path.clone()));
+        let one = store.get("c1").expect("会话应存在");
+        assert!(!one.turns[0].assistant.contains("<execute"));
+        assert!(one.turns[0].assistant.contains("已执行命令"));
+        if let HistoryBlock::Text { text } = &one.turns[0].blocks[0] {
+            assert!(!text.contains("<execute"));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

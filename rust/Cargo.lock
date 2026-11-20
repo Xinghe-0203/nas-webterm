@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "nas-webterm"
-version = "1.2.5"
+version = "1.2.6"
 dependencies = [
  "axum",
  "futures-util",

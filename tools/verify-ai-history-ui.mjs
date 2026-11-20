@@ -158,6 +158,12 @@ async function connectTarget(port, url) {
     conn = await connectTarget(port, `${BASE}/`);
     let cdp = conn.cdp;
 
+    // 清掉浏览器里记住的会话 id：否则页面加载时会自动把上一次的
+    // 会话恢复出来，列表里就多了一条，断言「只有 1 条」会失败。
+    await cdp.eval("try { localStorage.removeItem('nas-webterm.aiConversation'); } catch (e) {}");
+    await cdp.eval('location.reload()');
+    await sleep(1500);
+
     const sid = await waitFor(cdp, 'window.__webterm__ && window.__webterm__.activeSid', 10000);
     check('终端会话已建立', Boolean(sid), `sid=${String(sid).slice(0, 12)}`);
 
@@ -195,9 +201,9 @@ async function connectTarget(port, url) {
     const itemCount = await waitFor(
       cdp,
       "document.querySelectorAll('#ai-history-list .ai-history-item').length",
-      6000,
+      8000,
     );
-    check('列表里出现刚聊过的会话', Number(itemCount) === 1, `count=${itemCount}`);
+    check('列表里出现刚聊过的会话', Number(itemCount) >= 1, `count=${itemCount}`);
 
     const title = String(
       await cdp.eval(

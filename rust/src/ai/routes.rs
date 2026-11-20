@@ -138,6 +138,72 @@ struct AgentStartBody {
     /// 续哪个会话（空 = 新会话）。服务端据此把这一轮追加到对应的历史里。
     #[serde(default, alias = "conversationId")]
     conversation_id: Option<String>,
+    /// 断线重连：要接回的任务 id（前端从响应头 X-Run-Id 拿到的）
+    #[serde(default, alias = "resumeRunId")]
+    resume_run_id: Option<String>,
+    /// 客户端生成的请求 id：同一条消息的所有重试共用同一个值。
+    ///
+    /// 比「比对文本」更准确：用户短时间内又问了一遍同样的话时，
+    /// 不应该被当成重试、直接回放旧答案。
+    #[serde(default, alias = "requestId")]
+    request_id: Option<String>,
+    /// 已经收到的最后一条事件序号：服务端从它之后接着发
+    #[serde(default, alias = "afterSeq")]
+    after_seq: u64,
+}
+
+/// 断线重连：接回正在跑的任务。
+#[derive(serde::Deserialize)]
+struct AgentResumeBody {
+    /// 要接回的任务 id（前端从响应头 X-Run-Id 拿到的）
+    #[serde(alias = "runId")]
+    run_id: String,
+    /// 已经收到的最后一条事件序号（从 SSE 的 id 字段拿）
+    #[serde(default, alias = "afterSeq")]
+    after_seq: u64,
+}
+
+/// 接回一个还在跑的任务，把断线期间漏掉的事件补上。
+///
+/// 手机上切后台、锁屏、地铁里网络抖动都会让 SSE 断掉。原来的行为是
+/// 任务直接死掉——模型调用花了钱、命令执行了一半，用户回来只看到半截。
+/// 现在任务会进入宽限期等客户端回来，这里就是它回来的入口。
+async fn ai_agent_resume(
+    State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<AgentResumeBody>>,
+) -> Response {
+    let Some(axum::Json(payload)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"ok": false, "error": "缺少请求体"})),
+        )
+            .into_response();
+    };
+    let Some(run) = state.agents.get(&payload.run_id) else {
+        // 任务已经结束或不存在：前端应当按「任务已结束」处理
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "任务已结束或不存在",
+                "code": "not_found",
+            })),
+        )
+            .into_response();
+    };
+    if run.is_finished() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "任务已结束",
+                "code": "not_found",
+            })),
+        )
+            .into_response();
+    }
+    let ids = Some((run.id.clone(), run.conversation_id()));
+    sse_response(&run.bus(), payload.after_seq, ids)
 }
 
 /// 会话列表（最近的在前）。
@@ -249,6 +315,57 @@ async fn ai_agent_start(
         None
     };
 
+    // 同一个会话如果已经有任务在跑：
+    //   * 请求带的 resume_run_id 就是它 → 它自己断线重连，接回去；
+    //   * 请求 id 与它相同 → 是同一条消息的重试（首次响应丢了），
+    //     也接回去，别开第二个任务；
+    //   * 老客户端没带请求 id 时，退回「内容一模一样」判断。
+    // 别的情況（用户发了条新消息）照旧返回 409「已有 AI 任务正在运行」——
+    // 静默吞掉新消息比报错更糟。
+    if let Some(existing) = state.agents.find_by_sid(&payload.sid) {
+        let wanted = payload.resume_run_id.as_deref().unwrap_or("");
+        let rid = payload.request_id.as_deref().filter(|s| !s.is_empty());
+        // 任务「逻辑上已完成」（done 已发）时不算占着会话：允许开新任务。
+        // 但它的事件流可能还在收尾（记忆兜底），客户端若带着同一个
+        // runId / 同一个请求 id / 同一句话来，仍然接回去，避免同一轮被重复执行。
+        //
+        // 判断顺序：
+        //   1. runId 一致 → 同一条任务的重连；
+        //   2. 请求 id 一致 → 同一条消息的重试（最准，能区分「又问了一遍同样的话」）；
+        //   3. 老客户端没请求 id 时退回文本比对（仅在没有 runId 时）。
+        let same_request = wanted == existing.id
+            || match rid {
+                Some(id) => {
+                    let existing_id = existing.request_id();
+                    !existing_id.is_empty() && existing_id == id
+                }
+                None => wanted.is_empty() && payload.text == existing.user_text(),
+            };
+        if same_request {
+            let bus = existing.bus();
+            // 把该任务用的会话 id 一起回给前端：否则前端会继续拿自己
+            // 记着的旧 id 发下一轮，模型的上下文就会接错会话。
+            let ids = Some((existing.id.clone(), existing.conversation_id()));
+            return sse_response(&bus, payload.after_seq, ids);
+        }
+        // 不是同一个请求：任务已结束（done 已发）就清掉它，让新任务能开始；
+        // 还在跑就如实报冲突。
+        if existing.is_finished() {
+            state.agents.remove(&existing.id);
+        } else {
+            // 任务还在跑，这确实是「用户发了条新消息」→ 409，
+            // 别让后面的 create 把它当成「重试」接回去。
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "error": "该会话已有 AI 任务正在运行，请等它结束或先停止",
+                    "code": "busy",
+                })),
+            )
+                .into_response();
+        }
+    }
     let run = match state.agents.create(&payload.sid) {
         Ok(r) => r,
         Err(e) => {
@@ -264,7 +381,16 @@ async fn ai_agent_start(
         }
     };
     let run_id = run.id.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
+    // 记下用户请求原文（同步设置，不能放到异步任务里）：
+    // 客户端重发同一条请求时据此判断「是重试」，接回这个任务，
+    // 而不是报「已有 AI 任务正在运行」。
+    run.set_user_text(&payload.text);
+    if let Some(rid) = payload.request_id.as_deref() {
+        run.set_request_id(rid);
+    }
+    // 事件总线：事件先存再广播，客户端断线重连能补上漏掉的
+    let bus = run.bus();
+    let bus_for_task = bus.clone();
 
     let store = state.agents.clone();
     let text = payload.text.clone();
@@ -288,6 +414,8 @@ async fn ai_agent_start(
         None => payload.messages.clone(),
     };
     let history_store = state.ai.history().clone();
+    // 记下会话 id：断线重连时把同一个 id 回给前端
+    run.set_conversation_id(&conversation_id);
     let conversation_for_task = conversation_id.clone();
     // 长期记忆：跨会话保留的事实（模型用 <remember> 写入）
     let memory = if cfg.memory_enabled {
@@ -296,6 +424,9 @@ async fn ai_agent_start(
         None
     };
     let memory_path = state.ai.memory_path();
+    // 先建 SSE 响应（= 订阅事件总线），再启动任务：
+    // 反过来的话任务可能已经跑完了，订阅才建立，中间的事件就漏了。
+    let resp = sse_response(&bus, 0, Some((run_id.clone(), conversation_id.clone())));
     tokio::spawn(async move {
         crate::ai::agent::run_task(
             run_for_task,
@@ -309,14 +440,73 @@ async fn ai_agent_start(
             memory_path,
             conversation_for_task,
             history_store,
-            tx,
+            bus_for_task,
         )
         .await;
     });
 
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
-    });
+    resp
+}
+
+/// 构造 SSE 响应。
+///
+/// `after_seq` 是客户端已经收到的最后一条事件序号：服务端把序号更大的
+/// 事件先补发一遍，再接上实时流。客户端断线重连时带着这个序号来，
+/// 就不会漏看中间的内容，也不会重复。
+fn sse_response(
+    bus: &std::sync::Arc<crate::ai::events::EventBus>,
+    after_seq: u64,
+    ids: Option<(String, String)>,
+) -> axum::response::Response {
+    // 先订阅再补发：订阅在前，保证补发期间产生的新事件不会丢。
+    //
+    // 但这样一来，「订阅之后、快照之前」那段时间产生的事件会**同时**
+    // 出现在补发列表和实时流里 → 客户端收到两遍。解决办法是记住快照的
+    // 最大序号，实时流里比它小的直接跳过。
+    let (sub_id, rx) = bus.subscribe();
+    let snapshot: Vec<(u64, String)> = bus.replay_since(after_seq);
+    let snapshot_max = snapshot.last().map(|(s, _)| *s).unwrap_or(after_seq);
+    let replay = snapshot.into_iter().map(|(_, f)| f);
+    // 心跳：模型思考时可能几十秒不吐一个字，中间的反代 / 网关会当成
+    // 空闲连接把 SSE 掐掉（手机锁屏后尤其明显）。定期发一行 SSE 注释
+    // （客户端会忽略）就能把连接保活。
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 客户端断开时取消订阅：agent 由此知道「没人看了」。
+    // guard 必须活到响应体被丢弃为止，所以它跟着 stream 一起走
+    // （放进 stream 的状态里，流结束/被丢弃时才 Drop）。
+    let stream = futures_util::stream::unfold(
+        (
+            rx,
+            replay.into_iter(),
+            Some(SubscriptionGuard { bus: bus.clone(), id: sub_id }),
+            snapshot_max,
+            heartbeat,
+        ),
+        |(mut rx, mut replay, guard, snapshot_max, mut heartbeat)| async move {
+            loop {
+                if let Some(chunk) = replay.next() {
+                    return Some((Ok::<_, std::convert::Infallible>(chunk), (rx, replay, guard, snapshot_max, heartbeat)));
+                }
+                tokio::select! {
+                    maybe = rx.recv() => match maybe {
+                        Some((seq, chunk)) => {
+                            // 补发快照里已经给过的，不重复给
+                            if seq <= snapshot_max {
+                                continue;
+                            }
+                            return Some((Ok(chunk), (rx, replay, guard, snapshot_max, heartbeat)));
+                        }
+                        None => return None,
+                    },
+                    _ = heartbeat.tick() => {
+                        // SSE 注释行：客户端不渲染，只用来保活
+                        return Some((Ok(": ping\n\n".to_string()), (rx, replay, guard, snapshot_max, heartbeat)));
+                    }
+                }
+            }
+        },
+    );
 
     let mut resp = axum::response::Response::new(axum::body::Body::from_stream(stream));
     resp.headers_mut().insert(
@@ -327,18 +517,37 @@ async fn ai_agent_start(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache"),
     );
-    resp.headers_mut().insert(
-        "X-Run-Id",
-        axum::http::HeaderValue::from_str(&run_id)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("run")),
-    );
-    // 前端据此记住「现在是哪个会话」，下一轮继续追加到它后面。
-    resp.headers_mut().insert(
-        "X-Conversation-Id",
-        axum::http::HeaderValue::from_str(&conversation_id)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("conv")),
-    );
+    if let Some((run_id, conversation_id)) = ids {
+        resp.headers_mut().insert(
+            "X-Run-Id",
+            axum::http::HeaderValue::from_str(&run_id)
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("run")),
+        );
+        // 前端据此记住「现在是哪个会话」，下一轮继续追加到它后面。
+        if !conversation_id.is_empty() {
+            resp.headers_mut().insert(
+                "X-Conversation-Id",
+                axum::http::HeaderValue::from_str(&conversation_id)
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("conv")),
+            );
+        }
+    }
     resp
+}
+
+/// SSE 连接结束时取消订阅。
+///
+/// 客户端断开（关页面 / 网络断了）时，订阅被撤销，agent 就知道
+/// 「现在没人看」，进入宽限期等它回来。
+struct SubscriptionGuard {
+    bus: std::sync::Arc<crate::ai::events::EventBus>,
+    id: u64,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.bus.unsubscribe(self.id);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -394,6 +603,18 @@ async fn ai_agent_decide(
             }
         }
     }
+    if decision == crate::ai::agent::Decision::Stop {
+        // 「停止」任何时候都有效：哪怕当前没有待审批的命令，
+        // 也要把整个任务叫停（模型流 / 等命令 / 宽限期都算）。
+        run.cancel();
+        let acted = run.decide(decision, None);
+        return axum::Json(serde_json::json!({
+            "ok": true,
+            // acted=false 表示没有待审批命令，但取消标记已经设置好了
+            "data": {"pending": acted},
+        }))
+        .into_response();
+    }
     if run.decide(decision, payload.command.clone()) {
         axum::Json(serde_json::json!({"ok": true})).into_response()
     } else {
@@ -443,6 +664,10 @@ pub fn register_routes(
     .route(
         &format!("{}/api/ai/agent/decide", prefix),
         axum::routing::post(ai_agent_decide),
+    )
+    .route(
+        &format!("{}/api/ai/agent/resume", prefix),
+        axum::routing::post(ai_agent_resume),
     )
     .route(
         &format!("{}/api/ai/memory", prefix),

@@ -375,7 +375,7 @@ verify_variant_source_build() {
     echo "--- 验证 ${variant} 源码可独立构建 ---"
     if [ "${variant}" = "plain" ]; then
         # 普通版：不能出现任何 AI 源码
-        for pat in 'ai.rs' 'agent.rs' 'history.rs' 'panel.ts' 'bridge-ai.ts' 'inline.ts' 'detect.ts' 'history.ts'; do
+        for pat in 'ai.rs' 'agent.rs' 'history.rs' 'events.rs' 'protocol.rs' 'panel.ts' 'bridge-ai.ts' 'inline.ts' 'detect.ts' 'history.ts'; do
             if find "${src}" -name "${pat}" 2>/dev/null | grep -q .; then
                 fail "普通版源码里还有 AI 文件：${pat}"
             fi
